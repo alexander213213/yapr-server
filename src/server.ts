@@ -39,6 +39,7 @@ type ServerAckMessage = {
     clientMessageId: string
     messageId: string
     status: "accepted"
+    timestamp: number
 }
 
 type AuthedSocket = net.Socket & { userId?: string }
@@ -259,12 +260,13 @@ function relayMessage(socket: AuthedSocket, message: SendMessage) {
         }
         throw err
     }
-
+    const msg = findMessageByMessageIdStmt.get(messageId) as MessageRow
     const ack: ServerAckMessage = {
         type: "server_ack",
         clientMessageId: message.clientMessageId,
         messageId,
-        status: "accepted"
+        status: "accepted",
+        timestamp: msg.created_at
     }
     send(socket, ack)
 
