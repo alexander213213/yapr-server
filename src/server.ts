@@ -88,7 +88,7 @@ const findUserStmt = db.prepare(`
 `);
 
 const insertMessageStmt = db.prepare(`
-    INSERT INTO pending_messages (message_Id, client_message_id, sender_id, recipient_id, text)
+    INSERT INTO pending_messages (message_Id, client_message_id, sender_id, recipient_id, text, created_at)
     VALUES (?, ?, ?, ?, ?)
 `)
 
@@ -251,8 +251,9 @@ function relayMessage(socket: AuthedSocket, message: SendMessage) {
         send(socket, idempotencytAck)
         return
     }
+    const now = Date.now()
     try {
-        insertMessageStmt.run(messageId, message.clientMessageId, socket.userId, message.to, message.text)
+        insertMessageStmt.run(messageId, message.clientMessageId, socket.userId, message.to, message.text, now)
     } catch (err: any) {
         if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
             send(socket, idempotencytAck)
@@ -266,7 +267,7 @@ function relayMessage(socket: AuthedSocket, message: SendMessage) {
         clientMessageId: message.clientMessageId,
         messageId,
         status: "accepted",
-        timestamp: msg.created_at
+        timestamp: now
     }
     send(socket, ack)
 

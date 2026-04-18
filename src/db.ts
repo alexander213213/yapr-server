@@ -14,7 +14,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     secret TEXT NOT NULL,
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
   );
 
   CREATE TABLE IF NOT EXISTS pending_messages (
@@ -23,7 +23,7 @@ db.exec(`
     sender_id TEXT NOT NULL,
     recipient_id TEXT NOT NULL,
     text TEXT NOT NULL,
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
     UNIQUE (sender_id, client_message_id)
   );
 
@@ -31,7 +31,7 @@ db.exec(`
     sender_id TEXT NOT NULL,
     client_message_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
     PRIMARY KEY (sender_id, client_message_id)
   );
 
