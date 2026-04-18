@@ -89,7 +89,7 @@ const findUserStmt = db.prepare(`
 
 const insertMessageStmt = db.prepare(`
     INSERT INTO pending_messages (message_Id, client_message_id, sender_id, recipient_id, text, created_at)
-    VALUES (?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?)
 `)
 
 const findMessageByRecipientIdStmt = db.prepare(`
