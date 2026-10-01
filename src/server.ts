@@ -4,12 +4,18 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import db from "./db.js";
 import {
+  AckMessage,
   ClientMessage,
-  DeliveryAckMessage,
+  FetchKeysMessage,
+  FetchPendingMessage,
+  KeysResponse,
+  PendingDone,
+  ReadMessage,
   SendMessage,
   errorMessage,
   isErrorMessage,
   parseFrame,
+  versioned,
 } from "./protocol.js";
 import {
   dummyCompare,
@@ -32,20 +38,30 @@ import {
 } from "./limits.js";
 import { logger } from "./logger.js";
 
-export type IncomingMessage = {
-  type: "incoming_message";
+export type IncomingEnvelope = {
+  v: 2;
+  type: "incoming";
   messageId: string;
   from: string;
-  text: string;
+  ciphertext: string;
+  nonce: string;
   timestamp: number;
 };
 
 export type ServerAckMessage = {
+  v: 2;
   type: "server_ack";
   clientMessageId: string;
   messageId: string;
   status: "accepted";
   timestamp: number;
+};
+
+export type ReadReceipt = {
+  v: 2;
+  type: "read_receipt";
+  messageId: string;
+  reader: string;
 };
 
 type AuthedSocket = net.Socket & {
@@ -57,15 +73,18 @@ type UserRow = {
   user_id: string;
   secret: string;
   secret_hash: string | null;
+  pubkey: string | null;
   created_at: number;
 };
 
-type MessageRow = {
+type PendingRow = {
   message_id: string;
   client_message_id: string;
   sender_id: string;
   recipient_id: string;
-  text: string;
+  ciphertext: string;
+  nonce: string;
+  sender_timestamp: number;
   created_at: number;
 };
 
@@ -101,14 +120,24 @@ const authLimiter = new RateLimiter(
   Number(process.env.RATE_AUTH_MAX ?? 20),
   Number(process.env.RATE_AUTH_WINDOW_MS ?? 60_000)
 );
+const keysLimiter = new RateLimiter(
+  Number(process.env.RATE_KEYS_MAX ?? 60),
+  Number(process.env.RATE_KEYS_WINDOW_MS ?? 60_000)
+);
+
+/** Dedup horizon for idempotent resends; also the processed-table GC TTL. */
+export const PROCESSED_TTL_MS = Number(
+  process.env.PROCESSED_TTL_MS ?? 30 * 24 * 3600 * 1000
+);
+const GC_INTERVAL_MS = Number(process.env.GC_INTERVAL_MS ?? 3600 * 1000);
 
 const insertUserStmt = db.prepare(`
-    INSERT INTO users (user_id, secret, secret_hash)
-    VALUES (?, ?, ?)
+    INSERT INTO users (user_id, secret, secret_hash, pubkey)
+    VALUES (?, ?, ?, ?)
 `);
 
 const findUserStmt = db.prepare(`
-    SELECT user_id, secret, secret_hash, created_at
+    SELECT user_id, secret, secret_hash, pubkey, created_at
     FROM users
     WHERE user_id = ?
 `);
@@ -119,13 +148,26 @@ const updateSecretHashStmt = db.prepare(`
 `);
 
 const insertMessageStmt = db.prepare(`
-    INSERT INTO pending_messages (message_Id, client_message_id, sender_id, recipient_id, text, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO pending_messages
+      (message_id, client_message_id, sender_id, recipient_id, ciphertext, nonce, sender_timestamp, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
-const findMessageByRecipientIdStmt = db.prepare(`
-    SELECT * FROM pending_messages
+const findFirstPageStmt = db.prepare(`
+    SELECT message_id, client_message_id, sender_id, recipient_id, ciphertext, nonce, sender_timestamp, created_at
+    FROM pending_messages
     WHERE recipient_id = ?
+    ORDER BY created_at ASC, message_id ASC
+    LIMIT ?
+`);
+
+const findNextPageStmt = db.prepare(`
+    SELECT message_id, client_message_id, sender_id, recipient_id, ciphertext, nonce, sender_timestamp, created_at
+    FROM pending_messages
+    WHERE recipient_id = ?
+      AND (created_at > ? OR (created_at = ? AND message_id > ?))
+    ORDER BY created_at ASC, message_id ASC
+    LIMIT ?
 `);
 
 const findMessageByMessageIdStmt = db.prepare(`
@@ -138,9 +180,9 @@ const deleteMessageByMessageIdStmt = db.prepare(`
     WHERE message_id = ?
 `);
 
-const findMessageByClientMessageIdStmt = db.prepare(`
-    SELECT * FROM pending_messages
-    WHERE client_message_id = ? AND sender_id = ?
+const findPendingByClientMessageIdStmt = db.prepare(`
+    SELECT message_id, client_message_id FROM pending_messages
+    WHERE sender_id = ? AND client_message_id = ?
 `);
 
 const insertProcessedMessageStmt = db.prepare(`
@@ -148,9 +190,9 @@ const insertProcessedMessageStmt = db.prepare(`
     VALUES (?, ?, ?)
 `);
 
-const deleteProcessedMessageByClientMessageIdStmt = db.prepare(`
+const deleteProcessedByClientMessageIdStmt = db.prepare(`
     DELETE FROM processed_messages
-    WHERE client_message_id = ?
+    WHERE sender_id = ? AND client_message_id = ?
 `);
 
 const findProcessedMessageByClientMessageIdStmt = db.prepare(`
@@ -158,12 +200,35 @@ const findProcessedMessageByClientMessageIdStmt = db.prepare(`
     WHERE client_message_id = ? AND sender_id = ?
 `);
 
+const findProcessedMessageByMessageIdStmt = db.prepare(`
+    SELECT sender_id, client_message_id, message_id FROM processed_messages
+    WHERE message_id = ?
+`);
+
+const deleteProcessedOlderThanStmt = db.prepare(`
+    DELETE FROM processed_messages
+    WHERE created_at < ?
+`);
+
+function findPubKeys(userIds: string[]): Record<string, string> {
+  if (userIds.length === 0) return {};
+  const placeholders = userIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(`SELECT user_id, pubkey FROM users WHERE user_id IN (${placeholders})`)
+    .all(...userIds) as { user_id: string; pubkey: string | null }[];
+  const keys: Record<string, string> = {};
+  for (const row of rows) {
+    if (row.pubkey) keys[row.user_id] = row.pubkey;
+  }
+  return keys;
+}
+
 // node:sqlite has no db.transaction() helper (unlike better-sqlite3),
 // so the ack delete+insert is wrapped in explicit BEGIN/COMMIT.
 function ackTx(messageId: string, userId: string) {
   db.exec("BEGIN IMMEDIATE");
   try {
-    const pendingMsg = findMessageByMessageIdStmt.get(messageId) as MessageRow | undefined;
+    const pendingMsg = findMessageByMessageIdStmt.get(messageId) as PendingRow | undefined;
 
     if (!pendingMsg) throw new Error("Unknown Ack");
     if (pendingMsg.recipient_id !== userId) throw new Error("Wrong messageId or userId");
@@ -200,7 +265,7 @@ function clientIp(socket: net.Socket): string {
   return socket.remoteAddress ?? "unknown";
 }
 
-function registerUser(socket: AuthedSocket) {
+function registerUser(socket: AuthedSocket, pubKey: string) {
   let userId: string;
   try {
     userId = generateUserId((id) => findUserStmt.get(id) !== undefined);
@@ -209,13 +274,13 @@ function registerUser(socket: AuthedSocket) {
     return;
   }
   const secret = generateSecret();
-  insertUserStmt.run(userId, "", hashSecret(secret));
+  insertUserStmt.run(userId, "", hashSecret(secret), pubKey);
 
-  send(socket, {
+  send(socket, versioned({
     type: "registered",
     userId,
     secret,
-  });
+  }));
 }
 
 function verifyLogin(secret: string, user: UserRow): boolean {
@@ -258,11 +323,11 @@ function identifyUser(socket: AuthedSocket, userId: string, secret: string) {
     userSocket.end();
   }
   connections.set(userId, authedSocket);
-  sendPendingMessages(socket);
-  send(socket, {
+  sendPendingPage(socket);
+  send(socket, versioned({
     type: "identified",
     userId,
-  });
+  }));
   socket.once("close", () => {
     const current = connections.get(userId);
     if (current === socket) {
@@ -271,93 +336,197 @@ function identifyUser(socket: AuthedSocket, userId: string, secret: string) {
   });
 }
 
-function sendPendingMessages(socket: AuthedSocket) {
+const DEFAULT_PAGE_LIMIT = 50;
+const MAX_PAGE_LIMIT = 200;
+
+function toIncomingEnvelope(row: PendingRow): IncomingEnvelope {
+  return versioned({
+    type: "incoming",
+    from: row.sender_id,
+    messageId: row.message_id,
+    ciphertext: row.ciphertext,
+    nonce: row.nonce,
+    timestamp: row.created_at,
+  });
+}
+
+/** Deliver one page of the offline inbox, oldest first, then a done marker. */
+function sendPendingPage(
+  socket: AuthedSocket,
+  cursor?: { createdAt: number; messageId: string },
+  limit?: number
+) {
   if (!socket.userId) return;
-  const pendingMessages = findMessageByRecipientIdStmt.all(socket.userId) as MessageRow[];
-  if (pendingMessages.length === 0) return;
-  for (let i = 0; i < pendingMessages.length; i++) {
-    const pendingMessage = pendingMessages[i];
-    if (!pendingMessage) continue;
-    const payload: IncomingMessage = {
-      type: "incoming_message",
-      from: pendingMessage.sender_id,
-      messageId: pendingMessage.message_id,
-      text: pendingMessage.text,
-      timestamp: pendingMessage.created_at,
-    };
-    if (!send(socket, payload)) return;
+  const take = Math.min(limit ?? DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT);
+  const rows = (
+    cursor
+      ? findNextPageStmt.all(
+          socket.userId,
+          cursor.createdAt,
+          cursor.createdAt,
+          cursor.messageId,
+          take + 1
+        )
+      : findFirstPageStmt.all(socket.userId, take + 1)
+  ) as PendingRow[];
+  const hasMore = rows.length > take;
+  for (const row of rows.slice(0, take)) {
+    if (!send(socket, toIncomingEnvelope(row))) return;
   }
+  const done: PendingDone = versioned({ type: "pending_done", hasMore });
+  send(socket, done);
+}
+
+function handleFetchKeys(socket: AuthedSocket, message: FetchKeysMessage) {
+  if (!socket.userId) return;
+  const keys = findPubKeys(message.userIds);
+  const response: KeysResponse = versioned({ type: "keys", keys });
+  send(socket, response);
+}
+
+function handleFetchPending(socket: AuthedSocket, message: FetchPendingMessage) {
+  if (!socket.userId) return;
+  sendPendingPage(socket, message.cursor, message.limit);
+}
+
+type EnvelopeRef = { message_id: string; client_message_id: string };
+
+/** Idempotent send lookup, scoped to the sender. Stale dedup rows are reaped so
+ *  a clientMessageId can be reused after the TTL expires. */
+function findExistingEnvelope(
+  senderId: string,
+  clientMessageId: string
+): EnvelopeRef | undefined {
+  const pending = findPendingByClientMessageIdStmt.get(senderId, clientMessageId) as
+    | EnvelopeRef
+    | undefined;
+  if (pending) return pending;
+  const processed = findProcessedMessageByClientMessageIdStmt.get(senderId, clientMessageId) as
+    | (ProcessedMessageRow & { created_at: number })
+    | undefined;
+  if (!processed) return undefined;
+  if (Date.now() - processed.created_at < PROCESSED_TTL_MS) {
+    return { message_id: processed.message_id, client_message_id: processed.client_message_id };
+  }
+  deleteProcessedByClientMessageIdStmt.run(senderId, clientMessageId);
+  return undefined;
 }
 
 function relayMessage(socket: AuthedSocket, message: SendMessage) {
   if (!socket.userId) return;
+  const senderId: string = socket.userId;
   const recipient = findUserStmt.get(message.to) as UserRow | undefined;
   if (!recipient) {
     send(socket, errorMessage("NOT_FOUND", "recipient not found"));
     return;
   }
-  const messageId = generateMessageId();
-  const msg_exist = isMessageStored(socket, message.clientMessageId);
-  // NOTE (M2 will rewrite): this idempotency path is known-broken when the
-  // stored row is missing fields. Kept behavior-identical for M1; only the
-  // over-narrow Partial<ServerAckMessage> annotation is dropped for typecheck.
-  const idempotencytAck = {
-    type: "server_ack" as const,
-    messageId: msg_exist?.message_id,
-    clientMessageId: msg_exist?.client_message_id,
-    status: "accepted" as const,
-  };
-  if (msg_exist) {
-    send(socket, idempotencytAck);
+  const now = Date.now();
+  const existing = findExistingEnvelope(senderId, message.clientMessageId);
+  if (existing) {
+    const ack: ServerAckMessage = versioned({
+      type: "server_ack",
+      clientMessageId: existing.client_message_id,
+      messageId: existing.message_id,
+      status: "accepted",
+      timestamp: now,
+    });
+    send(socket, ack);
     return;
   }
-  const now = Date.now();
+  const messageId = generateMessageId();
   try {
     insertMessageStmt.run(
       messageId,
       message.clientMessageId,
-      socket.userId,
+      senderId,
       message.to,
-      message.text,
+      message.ciphertext,
+      message.nonce,
+      message.timestamp,
       now
     );
   } catch (err: unknown) {
     if ((err as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE") {
-      send(socket, idempotencytAck);
+      // Lost race with a concurrent identical send: answer from the stored row.
+      const raced = findExistingEnvelope(senderId, message.clientMessageId);
+      if (raced) {
+        const ack: ServerAckMessage = versioned({
+          type: "server_ack",
+          clientMessageId: raced.client_message_id,
+          messageId: raced.message_id,
+          status: "accepted",
+          timestamp: now,
+        });
+        send(socket, ack);
+      }
       return;
     }
     throw err;
   }
-  const ack: ServerAckMessage = {
+  const ack: ServerAckMessage = versioned({
     type: "server_ack",
     clientMessageId: message.clientMessageId,
     messageId,
     status: "accepted",
     timestamp: now,
-  };
+  });
   send(socket, ack);
 
   const recipientSocket = connections.get(message.to);
 
   if (!recipientSocket) return;
-  const payload: IncomingMessage = {
-    type: "incoming_message",
-    from: socket.userId,
+  // Same `now` as the ack: sender and recipient agree on the timestamp.
+  const payload: IncomingEnvelope = versioned({
+    type: "incoming",
+    from: senderId,
     messageId,
-    text: message.text,
-    timestamp: Date.now(),
-  };
+    ciphertext: message.ciphertext,
+    nonce: message.nonce,
+    timestamp: now,
+  });
 
   send(recipientSocket, payload);
 }
 
-function handleAck(socket: AuthedSocket, message: DeliveryAckMessage) {
+function handleAck(socket: AuthedSocket, message: AckMessage) {
   if (!socket.userId) return;
   try {
     ackTx(message.messageId, socket.userId);
   } catch {
-    send(socket, errorMessage("INVALID", "ack failed"));
+    // Already acked (idempotent OK) vs unknown id: only the latter is an error.
+    const processed = findProcessedMessageByMessageIdStmt.get(message.messageId) as
+      | { message_id: string }
+      | undefined;
+    if (!processed) {
+      send(socket, errorMessage("INVALID", "ack failed"));
+    }
   }
+}
+
+/** Best-effort sender notification. Dropped when the sender is offline;
+ *  never persisted. message_ids are unguessable UUIDs, so no recipient
+ *  check is enforced on already-acked rows. */
+function handleRead(socket: AuthedSocket, message: ReadMessage) {
+  if (!socket.userId) return;
+  const reader: string = socket.userId;
+  const pending = findMessageByMessageIdStmt.get(message.messageId) as PendingRow | undefined;
+  let senderId: string | undefined;
+  if (pending && pending.recipient_id === reader) {
+    senderId = pending.sender_id;
+  } else {
+    const processed = findProcessedMessageByMessageIdStmt.get(message.messageId) as
+      | { sender_id: string }
+      | undefined;
+    if (processed) senderId = processed.sender_id;
+  }
+  if (!senderId) {
+    send(socket, errorMessage("INVALID", "unknown message"));
+    return;
+  }
+  const senderSocket = connections.get(senderId);
+  if (!senderSocket) return;
+  const receipt: ReadReceipt = versioned({ type: "read_receipt", messageId: message.messageId, reader });
+  send(senderSocket, receipt);
 }
 
 function requireAuth(socket: AuthedSocket): socket is AuthedSocket & { userId: string } {
@@ -376,7 +545,7 @@ function handleMessage(socket: AuthedSocket, message: ClientMessage) {
         send(socket, errorMessage("RATE_LIMITED", "too many registrations"));
         return;
       }
-      registerUser(socket);
+      registerUser(socket, message.pubKey);
       break;
 
     case "identify":
@@ -387,7 +556,16 @@ function handleMessage(socket: AuthedSocket, message: ClientMessage) {
       identifyUser(socket, message.userId, message.secret);
       break;
 
-    case "send_message":
+    case "fetch_keys":
+      if (!requireAuth(socket)) return;
+      if (!keysLimiter.take(socket.userId)) {
+        send(socket, errorMessage("RATE_LIMITED", "too many key lookups"));
+        return;
+      }
+      handleFetchKeys(socket, message);
+      break;
+
+    case "send":
       if (!requireAuth(socket)) return;
       if (!sendLimiter.take(socket.userId)) {
         send(socket, errorMessage("RATE_LIMITED", "sending too fast"));
@@ -395,31 +573,20 @@ function handleMessage(socket: AuthedSocket, message: ClientMessage) {
       }
       relayMessage(socket, message);
       break;
-    case "delivery_ack":
+    case "ack":
       if (!requireAuth(socket)) return;
       handleAck(socket, message);
       break;
+    case "read":
+      if (!requireAuth(socket)) return;
+      handleRead(socket, message);
+      break;
+    case "fetch_pending":
+      if (!requireAuth(socket)) return;
+      handleFetchPending(socket, message);
+      break;
     case "pong":
       break;
-  }
-}
-
-function isMessageStored(socket: AuthedSocket, clientMessageId: string) {
-  if (!socket.userId) return undefined;
-  const userId: string = socket.userId;
-  const pendingMsg = findMessageByClientMessageIdStmt.get(clientMessageId, userId) as
-    | MessageRow
-    | undefined;
-  const processedMsg = findProcessedMessageByClientMessageIdStmt.get(clientMessageId, userId) as
-    | ProcessedMessageRow
-    | undefined;
-  if (!pendingMsg && !processedMsg) {
-    return undefined;
-  } else if (processedMsg && Date.now() - processedMsg.created_at < 86_400_000) {
-    return processedMsg!;
-  } else {
-    deleteProcessedMessageByClientMessageIdStmt.run(clientMessageId);
-    return pendingMsg!;
   }
 }
 
@@ -503,17 +670,34 @@ const heartbeat = setInterval(() => {
       sock.destroy();
       continue;
     }
-    send(sock, { type: "ping" });
+    send(sock, versioned({ type: "ping" }));
   }
   registerLimiter.sweep(now);
   sendLimiter.sweep(now);
   authLimiter.sweep(now);
+  keysLimiter.sweep(now);
 }, PING_INTERVAL_MS);
 heartbeat.unref();
+
+// Reap expired dedup rows so processed_messages stays bounded.
+const gc = setInterval(() => {
+  try {
+    const result = deleteProcessedOlderThanStmt.run(Date.now() - PROCESSED_TTL_MS) as {
+      changes: number | bigint;
+    };
+    if (Number(result.changes) > 0) {
+      logger.info({ reaped: Number(result.changes) }, "processed GC");
+    }
+  } catch (err) {
+    logger.warn({ err: String(err) }, "processed GC failed");
+  }
+}, GC_INTERVAL_MS);
+gc.unref();
 
 function shutdown(signal: string) {
   logger.info(`received ${signal}, shutting down...`);
   clearInterval(heartbeat);
+  clearInterval(gc);
   server.close(() => {
     try {
       db.close();
