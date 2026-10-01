@@ -60,6 +60,21 @@ npm start            # node dist/server.js (production entrypoint)
 
 ## Deploying
 
+No Docker required. The default path is the platform buildpack (Railway, Render, plain VPS):
+
+1. Build: `npm ci && npm run build`. Start: `npm start` (runs `node dist/server.js`).
+   `engines` pins Node ≥ 22; `node:sqlite` is stdlib so there is no native toolchain step.
+2. Attach a TCP route to `PORT` (the proxy passes raw bytes; the server terminates TLS, so
+   the cert must be valid for the public hostname clients dial).
+3. Mount persistent storage at `/data` and set `YAPR_SERVER_DATA_DIR=/data`. Without this,
+   SQLite lives on the ephemeral filesystem and accounts + offline queue vanish on redeploy.
+4. Provide the cert as secret env vars (inline `TLS_CERT`/`TLS_KEY` PEM is simplest).
+5. Back up `/data/yapr.db` before deploying a build that migrates the schema (the server
+   refuses to open newer-than-expected databases).
+
+Prefer containers? A multi-stage `Dockerfile` is included (non-root `yapr` user, `/data`
+volume preset, 30s TLS `HEALTHCHECK`):
+
 ```bash
 docker build -t yapr-server .
 docker run -d --name yapr-server \
@@ -69,11 +84,6 @@ docker run -d --name yapr-server \
   -v yapr-data:/data \
   yapr-server
 ```
-
-On Railway: use the Dockerfile (or `npm ci && npm run build` + `npm start`), attach a TCP
-route to `PORT`, mount a volume at `/data` with `YAPR_SERVER_DATA_DIR=/data`, and provide
-the cert as secret env vars. Back up `/data/yapr.db` before deploying a build that migrates
-the schema (the server refuses to open newer-than-expected databases).
 
 ## Protocol (v2, breaking)
 
