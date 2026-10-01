@@ -1,7 +1,6 @@
 import net from "node:net";
 import crypto, { randomUUID } from "node:crypto";
-import db from "./db";
-import "dotenv/config"
+import db from "./db.js";
 
 
 type RegisterMessage = {
@@ -45,7 +44,6 @@ type ServerAckMessage = {
 type AuthedSocket = net.Socket & { userId?: string }
 
 type ClientMessage = RegisterMessage | IdentifyMessage | SendMessage | DeliveryAckMessage;
-type ServerMessage = IncomingMessage | ServerAckMessage
 
 type UserRow = {
     user_id: string;
@@ -69,11 +67,10 @@ type ProcessedMessageRow = {
     created_at: number
 }
 
-if (!process.env.PORT) {
-  throw new Error("PORT is not defined");
+const PORT = Number(process.env.PORT ?? "9000");
+if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
+  throw new Error(`Invalid PORT: ${process.env.PORT ?? "(unset)"}`);
 }
-
-const PORT = Number(process.env.PORT) || 9000;
 const connections = new Map<string, AuthedSocket>();
 
 const insertUserStmt = db.prepare(`
@@ -127,19 +124,32 @@ const findProcessedMessageByClientMessageIdStmt = db.prepare(`
     WHERE client_message_id = ? AND sender_id = ?
 `)
 
-const ackTx = db.transaction((messageId: string, userId: string) => {
-    const pendingMsg = findMessageByMessageIdStmt.get(messageId) as MessageRow | undefined;
+// node:sqlite has no db.transaction() helper (unlike better-sqlite3),
+// so the ack delete+insert is wrapped in explicit BEGIN/COMMIT.
+function ackTx(messageId: string, userId: string) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+        const pendingMsg = findMessageByMessageIdStmt.get(messageId) as MessageRow | undefined;
 
-    if (!pendingMsg) throw new Error("Unknown Ack");
-    if (pendingMsg.recipient_id !== userId) throw new Error("Wrong messageId or userId");
+        if (!pendingMsg) throw new Error("Unknown Ack");
+        if (pendingMsg.recipient_id !== userId) throw new Error("Wrong messageId or userId");
 
-    deleteMessageByMessageIdStmt.run(pendingMsg.message_id);
-    insertProcessedMessageStmt.run(
-        pendingMsg.message_id,
-        pendingMsg.client_message_id,
-        pendingMsg.sender_id
-    );
-});
+        deleteMessageByMessageIdStmt.run(pendingMsg.message_id);
+        insertProcessedMessageStmt.run(
+            pendingMsg.message_id,
+            pendingMsg.client_message_id,
+            pendingMsg.sender_id
+        );
+        db.exec("COMMIT");
+    } catch (err) {
+        try {
+            db.exec("ROLLBACK");
+        } catch {
+            // Best effort: the transaction may already be rolled back.
+        }
+        throw err;
+    }
+}
 
 function send(socket: net.Socket, payload: unknown) {
     socket.write(JSON.stringify(payload) + "\n");
@@ -216,10 +226,12 @@ function identifyUser(socket: AuthedSocket, userId: string, secret: string) {
 }
 
 function sendPendingMessages(socket: AuthedSocket) {
+    if (!socket.userId) return
     const pendingMessages = findMessageByRecipientIdStmt.all(socket.userId) as MessageRow[]
     if (pendingMessages.length === 0) return
     for (let i = 0; i < pendingMessages.length; i++) {
         const pendingMessage = pendingMessages[i]
+        if (!pendingMessage) continue
         const payload: IncomingMessage = {
             type: 'incoming_message',
             from: pendingMessage.sender_id,
@@ -241,11 +253,14 @@ function relayMessage(socket: AuthedSocket, message: SendMessage) {
     }
     const messageId = generateMessageId()
     const msg_exist = isMessageStored(socket, message.clientMessageId)
-    const idempotencytAck: Partial<ServerAckMessage> = {
-        type: "server_ack",
+    // NOTE (M2 will rewrite): this idempotency path is known-broken when the
+    // stored row is missing fields. Kept behavior-identical for M0; only the
+    // over-narrow Partial<ServerAckMessage> annotation is dropped for typecheck.
+    const idempotencytAck = {
+        type: "server_ack" as const,
         messageId: msg_exist?.message_id,
         clientMessageId: msg_exist?.client_message_id,
-        status: "accepted"
+        status: "accepted" as const
     }
     if (msg_exist) {
         send(socket, idempotencytAck)
@@ -261,7 +276,6 @@ function relayMessage(socket: AuthedSocket, message: SendMessage) {
         }
         throw err
     }
-    const msg = findMessageByMessageIdStmt.get(messageId) as MessageRow
     const ack: ServerAckMessage = {
         type: "server_ack",
         clientMessageId: message.clientMessageId,
@@ -323,8 +337,10 @@ function sendError(socket: AuthedSocket, message: string) {
 }
 
 function isMessageStored(socket: AuthedSocket, clientMessageId: string) {
-    const pendingMsg = findMessageByClientMessageIdStmt.get(clientMessageId, socket.userId) as MessageRow | undefined
-    const processedMsg = findProcessedMessageByClientMessageIdStmt.get(clientMessageId, socket.userId) as ProcessedMessageRow | undefined
+    if (!socket.userId) return undefined
+    const userId: string = socket.userId
+    const pendingMsg = findMessageByClientMessageIdStmt.get(clientMessageId, userId) as MessageRow | undefined
+    const processedMsg = findProcessedMessageByClientMessageIdStmt.get(clientMessageId, userId) as ProcessedMessageRow | undefined
     if (!pendingMsg && !processedMsg) {
         return undefined
     } else if (processedMsg && (Date.now() - processedMsg.created_at) < 86_400_000) {
@@ -372,3 +388,19 @@ const server = net.createServer((rawSocket) => {
 server.listen(PORT, "0.0.0.0", () => {
     console.log(`yapr server listening on port ${PORT}`);
 });
+
+function shutdown(signal: string) {
+    console.log(`received ${signal}, shutting down...`);
+    server.close(() => {
+        try {
+            db.close();
+        } catch {
+            // Best effort: already closed.
+        }
+        process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));

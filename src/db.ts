@@ -1,16 +1,35 @@
-import Database from "better-sqlite3";
-import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
+import { dbPathFor, ensureDataDir } from "./storage.js";
 
-const dataDir = path.join(__dirname, "..", "data");
-fs.mkdirSync(dataDir, { recursive: true });
+const SCHEMA_VERSION = 1;
 
-const dbPath = path.join(dataDir, "yapr.db");
-const db = new Database(dbPath);
+const dataDir = ensureDataDir();
+const dbPath = dbPathFor(dataDir);
+const isNewFile = !fs.existsSync(dbPath);
 
-db.pragma("journal_mode = WAL");
+const db = new DatabaseSync(dbPath);
+
+if (isNewFile) {
+  try {
+    fs.chmodSync(dbPath, 0o600);
+  } catch {
+    // Windows / read-only FS: best effort only.
+  }
+}
 
 db.exec(`
+  PRAGMA journal_mode = WAL;
+  PRAGMA busy_timeout = 5000;
+  PRAGMA synchronous = NORMAL;
+  PRAGMA foreign_keys = ON;
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY
+  );
+
   CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     secret TEXT NOT NULL,
@@ -38,5 +57,18 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_pending_recipient
   ON pending_messages (recipient_id);
 `);
+
+const row = db
+  .prepare(`SELECT version FROM schema_version ORDER BY version DESC LIMIT 1`)
+  .get() as { version: number } | undefined;
+if (!row) {
+  db.prepare(`INSERT INTO schema_version (version) VALUES (?)`).run(SCHEMA_VERSION);
+} else if (row.version !== SCHEMA_VERSION) {
+  throw new Error(
+    `Unsupported schema version ${row.version} (expected ${SCHEMA_VERSION}). Refusing to open ${dbPath}.`
+  );
+}
+
+console.log(`using data dir ${dataDir}`);
 
 export default db;
