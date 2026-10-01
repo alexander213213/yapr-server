@@ -1,24 +1,28 @@
 {
   "name": "yapr-server",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Relay-only inbox for yapr terminal chat (Node 22, ESM-safe CJS build)",
+  "main": "dist/server.js",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "dev": "tsx src/server.ts",
+    "dev": "tsx --env-file=.env src/server.ts",
     "build": "tsc",
-    "start": "node dist/server.js"
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/server.js",
+    "test": "vitest run"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "better-sqlite3": "^12.8.0",
-    "dotenv": "^17.4.2"
+    "pino": "^9.6.0",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^25.5.0",
-    "install": "^0.13.0",
+    "@types/node": "^22.15.0",
     "tsx": "^4.21.0",
-    "typescript": "^6.0.2"
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
   }
 }
