@@ -11,7 +11,8 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "start": "node dist/server.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "certs": "bash scripts/gen-dev-certs.sh"
   },
   "author": "",
   "license": "ISC",

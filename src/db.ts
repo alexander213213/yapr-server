@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import { dbPathFor, ensureDataDir } from "./storage.js";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const dataDir = ensureDataDir();
 const dbPath = dbPathFor(dataDir);
@@ -33,6 +33,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     secret TEXT NOT NULL,
+    secret_hash TEXT,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
   );
 
@@ -63,6 +64,14 @@ const row = db
   .get() as { version: number } | undefined;
 if (!row) {
   db.prepare(`INSERT INTO schema_version (version) VALUES (?)`).run(SCHEMA_VERSION);
+} else if (row.version === 1) {
+  // v1 -> v2: hashed auth. Legacy rows keep the plaintext `secret` until the
+  // next successful login transparently re-hashes them (see identifyUser).
+  const cols = db.prepare(`PRAGMA table_info(users)`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === "secret_hash")) {
+    db.exec(`ALTER TABLE users ADD COLUMN secret_hash TEXT`);
+  }
+  db.prepare(`UPDATE schema_version SET version = ?`).run(SCHEMA_VERSION);
 } else if (row.version !== SCHEMA_VERSION) {
   throw new Error(
     `Unsupported schema version ${row.version} (expected ${SCHEMA_VERSION}). Refusing to open ${dbPath}.`
