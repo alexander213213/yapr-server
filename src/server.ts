@@ -125,6 +125,31 @@ const keysLimiter = new RateLimiter(
   Number(process.env.RATE_KEYS_WINDOW_MS ?? 60_000)
 );
 
+/** Operational counters, summarized to the log every STATS_INTERVAL_MS. */
+const stats = {
+  startedAt: Date.now(),
+  liveConnections: 0,
+  registered: 0,
+  identified: 0,
+  relayed: 0,
+  acked: 0,
+  readsForwarded: 0,
+  keysServed: 0,
+  framesRejected: 0,
+};
+const STATS_INTERVAL_MS = Number(process.env.STATS_INTERVAL_MS ?? 60_000);
+
+function pendingDepth(): number {
+  try {
+    const row = db.prepare(`SELECT COUNT(*) AS n FROM pending_messages`).get() as {
+      n: number;
+    };
+    return row.n;
+  } catch {
+    return -1;
+  }
+}
+
 /** Dedup horizon for idempotent resends; also the processed-table GC TTL. */
 export const PROCESSED_TTL_MS = Number(
   process.env.PROCESSED_TTL_MS ?? 30 * 24 * 3600 * 1000
@@ -275,6 +300,7 @@ function registerUser(socket: AuthedSocket, pubKey: string) {
   }
   const secret = generateSecret();
   insertUserStmt.run(userId, "", hashSecret(secret), pubKey);
+  stats.registered += 1;
 
   send(socket, versioned({
     type: "registered",
@@ -323,6 +349,7 @@ function identifyUser(socket: AuthedSocket, userId: string, secret: string) {
     userSocket.end();
   }
   connections.set(userId, authedSocket);
+  stats.identified += 1;
   sendPendingPage(socket);
   send(socket, versioned({
     type: "identified",
@@ -380,6 +407,7 @@ function sendPendingPage(
 function handleFetchKeys(socket: AuthedSocket, message: FetchKeysMessage) {
   if (!socket.userId) return;
   const keys = findPubKeys(message.userIds);
+  stats.keysServed += 1;
   const response: KeysResponse = versioned({ type: "keys", keys });
   send(socket, response);
 }
@@ -430,6 +458,7 @@ function relayMessage(socket: AuthedSocket, message: SendMessage) {
       status: "accepted",
       timestamp: now,
     });
+    stats.relayed += 1;
     send(socket, ack);
     return;
   }
@@ -470,6 +499,7 @@ function relayMessage(socket: AuthedSocket, message: SendMessage) {
     status: "accepted",
     timestamp: now,
   });
+  stats.relayed += 1;
   send(socket, ack);
 
   const recipientSocket = connections.get(message.to);
@@ -492,6 +522,7 @@ function handleAck(socket: AuthedSocket, message: AckMessage) {
   if (!socket.userId) return;
   try {
     ackTx(message.messageId, socket.userId);
+    stats.acked += 1;
   } catch {
     // Already acked (idempotent OK) vs unknown id: only the latter is an error.
     const processed = findProcessedMessageByMessageIdStmt.get(message.messageId) as
@@ -526,6 +557,7 @@ function handleRead(socket: AuthedSocket, message: ReadMessage) {
   const senderSocket = connections.get(senderId);
   if (!senderSocket) return;
   const receipt: ReadReceipt = versioned({ type: "read_receipt", messageId: message.messageId, reader });
+  stats.readsForwarded += 1;
   send(senderSocket, receipt);
 }
 
@@ -594,6 +626,7 @@ function onConnection(rawSocket: net.Socket) {
   rawSocket.setEncoding("utf8");
   const socket = rawSocket as AuthedSocket;
   socket.lastActivity = Date.now();
+  stats.liveConnections += 1;
   let buffer = "";
 
   const authTimer = setTimeout(() => {
@@ -604,7 +637,10 @@ function onConnection(rawSocket: net.Socket) {
   }, AUTH_TIMEOUT_MS);
   authTimer.unref();
 
-  socket.once("close", () => clearTimeout(authTimer));
+  socket.once("close", () => {
+    stats.liveConnections = Math.max(0, stats.liveConnections - 1);
+    clearTimeout(authTimer);
+  });
   socket.on("error", (err) => {
     logger.warn({ err: String(err), ip: clientIp(socket) }, "socket error");
   });
@@ -633,11 +669,13 @@ function onConnection(rawSocket: net.Socket) {
         }
         const parsed = parseFrame(raw);
         if (isErrorMessage(parsed)) {
+          stats.framesRejected += 1;
           send(socket, parsed);
         } else {
           try {
             handleMessage(socket, parsed);
           } catch (err) {
+            stats.framesRejected += 1;
             logger.warn({ err: String(err) }, "message handler failed");
             send(socket, errorMessage("INVALID", "could not process frame"));
           }
@@ -694,10 +732,31 @@ const gc = setInterval(() => {
 }, GC_INTERVAL_MS);
 gc.unref();
 
+// Periodic operational summary for platform logs.
+const statsTimer = setInterval(() => {
+  logger.info(
+    {
+      uptimeSec: Math.floor((Date.now() - stats.startedAt) / 1000),
+      liveConnections: stats.liveConnections,
+      pendingDepth: pendingDepth(),
+      registered: stats.registered,
+      identified: stats.identified,
+      relayed: stats.relayed,
+      acked: stats.acked,
+      readsForwarded: stats.readsForwarded,
+      keysServed: stats.keysServed,
+      framesRejected: stats.framesRejected,
+    },
+    "server stats"
+  );
+}, STATS_INTERVAL_MS);
+statsTimer.unref();
+
 function shutdown(signal: string) {
   logger.info(`received ${signal}, shutting down...`);
   clearInterval(heartbeat);
   clearInterval(gc);
+  clearInterval(statsTimer);
   server.close(() => {
     try {
       db.close();
