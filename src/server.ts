@@ -37,6 +37,7 @@ import {
   sendLimiter,
 } from "./limits.js";
 import { logger } from "./logger.js";
+import { isUniqueViolation } from "./sqlite.js";
 
 export type IncomingEnvelope = {
   v: 2;
@@ -475,7 +476,7 @@ function relayMessage(socket: AuthedSocket, message: SendMessage) {
       now
     );
   } catch (err: unknown) {
-    if ((err as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE") {
+    if (isUniqueViolation(err)) {
       // Lost race with a concurrent identical send: answer from the stored row.
       const raced = findExistingEnvelope(senderId, message.clientMessageId);
       if (raced) {
