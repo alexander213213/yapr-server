@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import { dbPathFor, ensureDataDir } from "./storage.js";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const dataDir = ensureDataDir();
 const dbPath = dbPathFor(dataDir);
@@ -43,11 +43,27 @@ db.exec(`
     client_message_id TEXT NOT NULL,
     sender_id TEXT NOT NULL,
     recipient_id TEXT NOT NULL,
+    group_id TEXT,
     ciphertext TEXT NOT NULL,
     nonce TEXT NOT NULL DEFAULT '',
     sender_timestamp INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
-    UNIQUE (sender_id, client_message_id)
+    UNIQUE (sender_id, client_message_id, recipient_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS groups (
+    group_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+  );
+
+  CREATE TABLE IF NOT EXISTS group_members (
+    group_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'member')),
+    joined_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+    PRIMARY KEY (group_id, user_id)
   );
 
   CREATE TABLE IF NOT EXISTS processed_messages (
@@ -55,7 +71,7 @@ db.exec(`
     client_message_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
-    PRIMARY KEY (sender_id, client_message_id)
+    PRIMARY KEY (sender_id, client_message_id, message_id)
   );
 
   CREATE INDEX IF NOT EXISTS idx_pending_recipient_created
@@ -161,11 +177,126 @@ if (version === 2) {
   console.log(`migrated ${legacy.length} pending rows to opaque envelopes`);
 }
 
+if (version === 3) {
+  // v3 -> v4: groups + fan-out-safe dedup. Rebuilds pending (group_id column,
+  // UNIQUE widened to per-recipient so one send can fan out to N rows) and
+  // processed (PK widened likewise so every member's ack lands). Backup first.
+  const backupPath = `${dbPath}.bak.v3.${Date.now()}`;
+  fs.copyFileSync(dbPath, backupPath);
+  console.log(`schema v3 backup at ${backupPath}`);
+
+  type OldPending = {
+    message_id: string;
+    client_message_id: string;
+    sender_id: string;
+    recipient_id: string;
+    ciphertext: string;
+    nonce: string;
+    sender_timestamp: number;
+    created_at: number;
+  };
+  const pend = db
+    .prepare(
+      `SELECT message_id, client_message_id, sender_id, recipient_id,
+              ciphertext, nonce, sender_timestamp, created_at
+       FROM pending_messages`
+    )
+    .all() as OldPending[];
+  type OldProcessed = {
+    sender_id: string;
+    client_message_id: string;
+    message_id: string;
+    created_at: number;
+  };
+  const proc = db
+    .prepare(
+      `SELECT sender_id, client_message_id, message_id, created_at
+       FROM processed_messages`
+    )
+    .all() as OldProcessed[];
+
+  db.exec(`ALTER TABLE pending_messages RENAME TO pending_messages_v3`);
+  db.exec(`
+    CREATE TABLE pending_messages (
+      message_id TEXT PRIMARY KEY,
+      client_message_id TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      recipient_id TEXT NOT NULL,
+      group_id TEXT,
+      ciphertext TEXT NOT NULL,
+      nonce TEXT NOT NULL DEFAULT '',
+      sender_timestamp INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      UNIQUE (sender_id, client_message_id, recipient_id)
+    )
+  `);
+  db.exec(`DROP TABLE processed_messages`);
+  db.exec(`
+    CREATE TABLE processed_messages (
+      sender_id TEXT NOT NULL,
+      client_message_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (sender_id, client_message_id, message_id)
+    )
+  `);
+  const insertPend = db.prepare(`
+    INSERT INTO pending_messages
+      (message_id, client_message_id, sender_id, recipient_id, group_id,
+       ciphertext, nonce, sender_timestamp, created_at)
+    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
+  `);
+  const insertProc = db.prepare(`
+    INSERT INTO processed_messages (sender_id, client_message_id, message_id, created_at)
+    VALUES (?, ?, ?, ?)
+  `);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const m of pend) {
+      insertPend.run(
+        m.message_id, m.client_message_id, m.sender_id, m.recipient_id,
+        m.ciphertext, m.nonce, m.sender_timestamp, m.created_at
+      );
+    }
+    for (const m of proc) {
+      insertProc.run(m.sender_id, m.client_message_id, m.message_id, m.created_at);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Best effort.
+    }
+    throw err;
+  }
+  db.exec(`DROP TABLE pending_messages_v3`);
+  db.prepare(`UPDATE schema_version SET version = ?`).run(SCHEMA_VERSION);
+  version = SCHEMA_VERSION;
+  console.log(`migrated ${pend.length} pending + ${proc.length} processed rows to v4`);
+}
+
 if (version !== SCHEMA_VERSION) {
   throw new Error(
     `Unsupported schema version ${version} (expected ${SCHEMA_VERSION}). Refusing to open ${dbPath}.`
   );
 }
+
+// Indexes last: baseline tables may predate columns the indexes reference
+// (migrations above bring them current first). IF NOT EXISTS keeps this
+// idempotent for fresh databases and re-runs.
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_pending_recipient_created
+  ON pending_messages (recipient_id, created_at, message_id);
+  CREATE INDEX IF NOT EXISTS idx_pending_group
+  ON pending_messages (recipient_id, group_id, created_at, message_id);
+  CREATE INDEX IF NOT EXISTS idx_processed_sender_client
+  ON processed_messages (sender_id, client_message_id);
+  CREATE INDEX IF NOT EXISTS idx_group_members_user
+  ON group_members (user_id, group_id);
+  CREATE INDEX IF NOT EXISTS idx_processed_message_id
+  ON processed_messages (message_id);
+`);
 
 console.log(`using data dir ${dataDir}`);
 

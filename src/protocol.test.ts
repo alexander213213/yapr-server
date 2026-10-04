@@ -80,4 +80,74 @@ describe("parseFrame (v2)", () => {
     );
     expect(isErrorMessage(msg)).toBe(true);
   });
+
+  it("parses group membership frames", () => {
+    expect(
+      parseFrame(`{${V},"type":"create_group","name":"fam","memberIds":["1","2"]}`)
+    ).toMatchObject({ type: "create_group", name: "fam" });
+    expect(parseFrame(`{${V},"type":"add_members","groupId":"g","userIds":["3"]}`)).toMatchObject({
+      type: "add_members",
+    });
+    expect(parseFrame(`{${V},"type":"remove_member","groupId":"g","userId":"3"}`)).toMatchObject({
+      type: "remove_member",
+    });
+    expect(parseFrame(`{${V},"type":"leave_group","groupId":"g"}`)).toMatchObject({
+      type: "leave_group",
+    });
+    expect(parseFrame(`{${V},"type":"rename_group","groupId":"g","name":"new"}`)).toMatchObject({
+      type: "rename_group",
+    });
+    expect(parseFrame(`{${V},"type":"fetch_groups"}`)).toMatchObject({ type: "fetch_groups" });
+    expect(
+      parseFrame(`{${V},"type":"request_history","groupId":"g","to":"1"}`)
+    ).toMatchObject({ type: "request_history" });
+  });
+
+  it("parses send_group with per-member envelopes", () => {
+    const msg = parseFrame(
+      JSON.stringify({
+        v: 2,
+        type: "send_group",
+        clientMessageId: "c",
+        groupId: "g",
+        envelopes: [
+          { to: "1", ciphertext: "Yw==", nonce: "bg==" },
+          { to: "2", ciphertext: "ZA==", nonce: "bg==" },
+        ],
+        timestamp: 5,
+      })
+    );
+    expect(isErrorMessage(msg)).toBe(false);
+    if (!isErrorMessage(msg) && msg.type === "send_group") {
+      expect(msg.envelopes).toHaveLength(2);
+    }
+  });
+
+  it("rejects empty or oversize envelope batches", () => {
+    const empty = parseFrame(
+      JSON.stringify({ v: 2, type: "send_group", clientMessageId: "c", groupId: "g", envelopes: [], timestamp: 1 })
+    );
+    expect(isErrorMessage(empty)).toBe(true);
+    const big = parseFrame(
+      JSON.stringify({
+        v: 2,
+        type: "send_group",
+        clientMessageId: "c",
+        groupId: "g",
+        envelopes: Array(51).fill({ to: "1", ciphertext: "Yw==", nonce: "bg==" }),
+        timestamp: 1,
+      })
+    );
+    expect(isErrorMessage(big)).toBe(true);
+  });
+
+  it("accepts optional groupId on direct sends", () => {
+    const msg = parseFrame(
+      `{${V},"type":"send","clientMessageId":"a","to":"1","ciphertext":"Yw==","nonce":"bg==","timestamp":1,"groupId":"g"}`
+    );
+    expect(isErrorMessage(msg)).toBe(false);
+    if (!isErrorMessage(msg) && msg.type === "send") {
+      expect(msg.groupId).toBe("g");
+    }
+  });
 });
