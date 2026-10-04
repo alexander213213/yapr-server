@@ -1,0 +1,13 @@
+# Pin the Nixpacks builder so Railway never auto-selects the Dockerfile in docker/.
+# The Dockerfile remains for local/container use only (`docker build -f docker/Dockerfile .`).
+[phases.setup]
+nixPkgs = ["nodejs_22"]
+
+[phases.install]
+cmds = ["npm ci"]
+
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "npm start"

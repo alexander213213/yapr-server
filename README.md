@@ -76,7 +76,7 @@ Prefer containers? A multi-stage `Dockerfile` is included (non-root `yapr` user,
 volume preset, 30s TLS `HEALTHCHECK`):
 
 ```bash
-docker build -t yapr-server .
+docker build -f docker/Dockerfile -t yapr-server .
 docker run -d --name yapr-server \
   -p 9000:9000 \
   -e PORT=9000 \
