@@ -5,12 +5,24 @@ import crypto from "node:crypto";
 import db from "./db.js";
 import {
   AckMessage,
+  AddMembersMessage,
   ClientMessage,
+  CreateGroupMessage,
   FetchKeysMessage,
   FetchPendingMessage,
+  GroupCreatedResponse,
+  GroupInfo,
+  GroupUpdatedNotice,
+  GroupsResponse,
+  HistoryRequestNotice,
   KeysResponse,
+  LeaveGroupMessage,
   PendingDone,
   ReadMessage,
+  RemoveMemberMessage,
+  RenameGroupMessage,
+  RequestHistoryMessage,
+  SendGroupMessage,
   SendMessage,
   errorMessage,
   isErrorMessage,
@@ -19,6 +31,7 @@ import {
 } from "./protocol.js";
 import {
   dummyCompare,
+  generateGroupId,
   generateMessageId,
   generateSecret,
   generateUserId,
@@ -47,6 +60,7 @@ export type IncomingEnvelope = {
   ciphertext: string;
   nonce: string;
   timestamp: number;
+  groupId?: string;
 };
 
 export type ServerAckMessage = {
@@ -54,6 +68,7 @@ export type ServerAckMessage = {
   type: "server_ack";
   clientMessageId: string;
   messageId: string;
+  messageIds?: string[];
   status: "accepted";
   timestamp: number;
 };
@@ -83,6 +98,7 @@ type PendingRow = {
   client_message_id: string;
   sender_id: string;
   recipient_id: string;
+  group_id: string | null;
   ciphertext: string;
   nonce: string;
   sender_timestamp: number;
@@ -95,6 +111,24 @@ type ProcessedMessageRow = {
   sender_id: string;
   created_at: number;
 };
+
+type GroupRow = {
+  group_id: string;
+  name: string;
+  creator_id: string;
+  created_at: number;
+};
+
+type MemberRow = {
+  group_id: string;
+  user_id: string;
+  role: "admin" | "member";
+  joined_at: number;
+};
+
+const MAX_GROUP_MEMBERS = 50;
+/** send_group carries up to 50 envelopes; sized accordingly (DoS-bounded). */
+const MAX_GROUP_FRAME_BYTES = Number(process.env.MAX_GROUP_FRAME_BYTES ?? 512 * 1024);
 
 const PORT = Number(process.env.PORT ?? "9000");
 if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
@@ -125,6 +159,10 @@ const keysLimiter = new RateLimiter(
   Number(process.env.RATE_KEYS_MAX ?? 60),
   Number(process.env.RATE_KEYS_WINDOW_MS ?? 60_000)
 );
+const groupLimiter = new RateLimiter(
+  Number(process.env.RATE_GROUP_MAX ?? 30),
+  Number(process.env.RATE_GROUP_WINDOW_MS ?? 60_000)
+);
 
 /** Operational counters, summarized to the log every STATS_INTERVAL_MS. */
 const stats = {
@@ -137,6 +175,8 @@ const stats = {
   readsForwarded: 0,
   keysServed: 0,
   framesRejected: 0,
+  groupsCreated: 0,
+  groupSends: 0,
 };
 const STATS_INTERVAL_MS = Number(process.env.STATS_INTERVAL_MS ?? 60_000);
 
@@ -175,12 +215,14 @@ const updateSecretHashStmt = db.prepare(`
 
 const insertMessageStmt = db.prepare(`
     INSERT INTO pending_messages
-      (message_id, client_message_id, sender_id, recipient_id, ciphertext, nonce, sender_timestamp, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      (message_id, client_message_id, sender_id, recipient_id, group_id,
+       ciphertext, nonce, sender_timestamp, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const findFirstPageStmt = db.prepare(`
-    SELECT message_id, client_message_id, sender_id, recipient_id, ciphertext, nonce, sender_timestamp, created_at
+    SELECT message_id, client_message_id, sender_id, recipient_id, group_id,
+           ciphertext, nonce, sender_timestamp, created_at
     FROM pending_messages
     WHERE recipient_id = ?
     ORDER BY created_at ASC, message_id ASC
@@ -188,7 +230,8 @@ const findFirstPageStmt = db.prepare(`
 `);
 
 const findNextPageStmt = db.prepare(`
-    SELECT message_id, client_message_id, sender_id, recipient_id, ciphertext, nonce, sender_timestamp, created_at
+    SELECT message_id, client_message_id, sender_id, recipient_id, group_id,
+           ciphertext, nonce, sender_timestamp, created_at
     FROM pending_messages
     WHERE recipient_id = ?
       AND (created_at > ? OR (created_at = ? AND message_id > ?))
@@ -209,6 +252,7 @@ const deleteMessageByMessageIdStmt = db.prepare(`
 const findPendingByClientMessageIdStmt = db.prepare(`
     SELECT message_id, client_message_id FROM pending_messages
     WHERE sender_id = ? AND client_message_id = ?
+    ORDER BY rowid ASC
 `);
 
 const insertProcessedMessageStmt = db.prepare(`
@@ -224,6 +268,7 @@ const deleteProcessedByClientMessageIdStmt = db.prepare(`
 const findProcessedMessageByClientMessageIdStmt = db.prepare(`
     SELECT * FROM processed_messages
     WHERE client_message_id = ? AND sender_id = ?
+    ORDER BY rowid ASC
 `);
 
 const findProcessedMessageByMessageIdStmt = db.prepare(`
@@ -234,6 +279,73 @@ const findProcessedMessageByMessageIdStmt = db.prepare(`
 const deleteProcessedOlderThanStmt = db.prepare(`
     DELETE FROM processed_messages
     WHERE created_at < ?
+`);
+
+const insertGroupStmt = db.prepare(`
+    INSERT INTO groups (group_id, name, creator_id, created_at)
+    VALUES (?, ?, ?, ?)
+`);
+
+const insertMemberStmt = db.prepare(`
+    INSERT OR IGNORE INTO group_members (group_id, user_id, role, joined_at)
+    VALUES (?, ?, ?, ?)
+`);
+
+const findGroupStmt = db.prepare(`
+    SELECT group_id, name, creator_id, created_at FROM groups WHERE group_id = ?
+`);
+
+const findMemberStmt = db.prepare(`
+    SELECT group_id, user_id, role, joined_at FROM group_members
+    WHERE group_id = ? AND user_id = ?
+`);
+
+const listGroupMembersStmt = db.prepare(`
+    SELECT group_id, user_id, role, joined_at FROM group_members
+    WHERE group_id = ?
+    ORDER BY joined_at ASC, user_id ASC
+`);
+
+const countGroupMembersStmt = db.prepare(`
+    SELECT COUNT(*) AS n FROM group_members WHERE group_id = ?
+`);
+
+const removeMemberStmt = db.prepare(`
+    DELETE FROM group_members WHERE group_id = ? AND user_id = ?
+`);
+
+const deleteGroupMembersStmt = db.prepare(`
+    DELETE FROM group_members WHERE group_id = ?
+`);
+
+const deleteGroupStmt = db.prepare(`
+    DELETE FROM groups WHERE group_id = ?
+`);
+
+const updateGroupNameStmt = db.prepare(`
+    UPDATE groups SET name = ? WHERE group_id = ?
+`);
+
+const updateMemberRoleStmt = db.prepare(`
+    UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?
+`);
+
+const longestTenuredMemberStmt = db.prepare(`
+    SELECT user_id FROM group_members
+    WHERE group_id = ? AND user_id != ?
+    ORDER BY joined_at ASC, user_id ASC
+    LIMIT 1
+`);
+
+const listUserGroupsStmt = db.prepare(`
+    SELECT g.group_id, g.name, g.creator_id, g.created_at
+    FROM groups g JOIN group_members m ON m.group_id = g.group_id
+    WHERE m.user_id = ?
+    ORDER BY g.created_at ASC, g.group_id ASC
+`);
+
+const deletePendingForStmt = db.prepare(`
+    DELETE FROM pending_messages WHERE recipient_id = ? AND group_id = ?
 `);
 
 function findPubKeys(userIds: string[]): Record<string, string> {
@@ -368,7 +480,7 @@ const DEFAULT_PAGE_LIMIT = 50;
 const MAX_PAGE_LIMIT = 200;
 
 function toIncomingEnvelope(row: PendingRow): IncomingEnvelope {
-  return versioned({
+  const envelope: IncomingEnvelope = versioned({
     type: "incoming",
     from: row.sender_id,
     messageId: row.message_id,
@@ -376,6 +488,29 @@ function toIncomingEnvelope(row: PendingRow): IncomingEnvelope {
     nonce: row.nonce,
     timestamp: row.created_at,
   });
+  if (row.group_id) envelope.groupId = row.group_id;
+  return envelope;
+}
+
+function groupInfoFor(groupId: string): GroupInfo | undefined {
+  const group = findGroupStmt.get(groupId) as GroupRow | undefined;
+  if (!group) return undefined;
+  const members = listGroupMembersStmt.all(groupId) as MemberRow[];
+  return {
+    groupId: group.group_id,
+    name: group.name,
+    members: members.map((m) => ({ userId: m.user_id, role: m.role, joinedAt: m.joined_at })),
+  };
+}
+
+/** Notify every online member that a group's roster or name changed. */
+function broadcastGroupUpdated(groupId: string): void {
+  const members = listGroupMembersStmt.all(groupId) as MemberRow[];
+  const notice: GroupUpdatedNotice = versioned({ type: "group_updated", groupId });
+  for (const member of members) {
+    const sock = connections.get(member.user_id);
+    if (sock) send(sock, notice);
+  }
 }
 
 /** Deliver one page of the offline inbox, oldest first, then a done marker. */
@@ -418,27 +553,221 @@ function handleFetchPending(socket: AuthedSocket, message: FetchPendingMessage) 
   sendPendingPage(socket, message.cursor, message.limit);
 }
 
+function requireGroupAdmin(
+  socket: AuthedSocket,
+  groupId: string
+): { group: GroupRow; member: MemberRow } | undefined {
+  const userId = socket.userId;
+  if (!userId) {
+    send(socket, errorMessage("UNAUTH", "identify first"));
+    return undefined;
+  }
+  const group = findGroupStmt.get(groupId) as GroupRow | undefined;
+  if (!group) {
+    send(socket, errorMessage("NOT_FOUND", "group not found"));
+    return undefined;
+  }
+  const member = findMemberStmt.get(groupId, userId) as MemberRow | undefined;
+  if (!member || member.role !== "admin") {
+    send(socket, errorMessage("UNAUTH", "group admin required"));
+    return undefined;
+  }
+  return { group, member };
+}
+
+function handleCreateGroup(socket: AuthedSocket, message: CreateGroupMessage) {
+  if (!socket.userId) return;
+  const creatorId: string = socket.userId;
+  const memberIds = [...new Set(message.memberIds)].filter((id) => id !== creatorId);
+  if (memberIds.length + 1 > MAX_GROUP_MEMBERS) {
+    send(socket, errorMessage("INVALID", `groups are capped at ${MAX_GROUP_MEMBERS} members`));
+    return;
+  }
+  for (const id of memberIds) {
+    if (!findUserStmt.get(id)) {
+      send(socket, errorMessage("NOT_FOUND", "member not found"));
+      return;
+    }
+  }
+  const now = Date.now();
+  const groupId = generateGroupId();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    insertGroupStmt.run(groupId, message.name, creatorId, now);
+    insertMemberStmt.run(groupId, creatorId, "admin", now);
+    for (const id of memberIds) {
+      insertMemberStmt.run(groupId, id, "member", now);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Best effort.
+    }
+    throw err;
+  }
+  stats.groupsCreated += 1;
+  const created: GroupCreatedResponse = versioned({ type: "group_created", groupId });
+  send(socket, created);
+  broadcastGroupUpdated(groupId);
+}
+
+function handleAddMembers(socket: AuthedSocket, message: AddMembersMessage) {
+  const gate = requireGroupAdmin(socket, message.groupId);
+  if (!gate) return;
+  const memberIds = [...new Set(message.userIds)];
+  for (const id of memberIds) {
+    if (!findUserStmt.get(id)) {
+      send(socket, errorMessage("NOT_FOUND", "member not found"));
+      return;
+    }
+  }
+  const current = (countGroupMembersStmt.get(message.groupId) as { n: number }).n;
+  const fresh = memberIds.filter(
+    (id) => !findMemberStmt.get(message.groupId, id)
+  );
+  if (current + fresh.length > MAX_GROUP_MEMBERS) {
+    send(socket, errorMessage("INVALID", `groups are capped at ${MAX_GROUP_MEMBERS} members`));
+    return;
+  }
+  const now = Date.now();
+  for (const id of fresh) {
+    insertMemberStmt.run(message.groupId, id, "member", now);
+  }
+  broadcastGroupUpdated(message.groupId);
+}
+
+function dropMembership(groupId: string, userId: string): void {
+  const departing = findMemberStmt.get(groupId, userId) as MemberRow | undefined;
+  removeMemberStmt.run(groupId, userId);
+  // Undeliverable inbox rows for the departed member must not leak.
+  deletePendingForStmt.run(userId, groupId);
+  const remaining = (countGroupMembersStmt.get(groupId) as { n: number }).n;
+  if (remaining === 0) {
+    deleteGroupMembersStmt.run(groupId);
+    deleteGroupStmt.run(groupId);
+    return;
+  }
+  // An admin departing without successors promotes the longest-tenured member.
+  if (departing?.role === "admin") {
+    const admins = (listGroupMembersStmt.all(groupId) as MemberRow[]).filter(
+      (m) => m.role === "admin"
+    );
+    if (admins.length === 0) {
+      const heir = longestTenuredMemberStmt.get(groupId, userId) as
+        | { user_id: string }
+        | undefined;
+      if (heir) {
+        updateMemberRoleStmt.run("admin", groupId, heir.user_id);
+      }
+    }
+  }
+}
+
+function handleRemoveMember(socket: AuthedSocket, message: RemoveMemberMessage) {
+  const gate = requireGroupAdmin(socket, message.groupId);
+  if (!gate) return;
+  if (message.userId === socket.userId) {
+    send(socket, errorMessage("INVALID", "use leave_group to remove yourself"));
+    return;
+  }
+  dropMembership(message.groupId, message.userId);
+  broadcastGroupUpdated(message.groupId);
+  const removedSocket = connections.get(message.userId);
+  if (removedSocket) {
+    send(removedSocket, versioned({ type: "group_updated", groupId: message.groupId }));
+  }
+}
+
+function handleLeaveGroup(socket: AuthedSocket, message: LeaveGroupMessage) {
+  if (!socket.userId) return;
+  const member = findMemberStmt.get(message.groupId, socket.userId) as MemberRow | undefined;
+  if (!member) {
+    send(socket, errorMessage("NOT_FOUND", "not a group member"));
+    return;
+  }
+  const userId: string = socket.userId;
+  dropMembership(message.groupId, userId);
+  broadcastGroupUpdated(message.groupId);
+}
+
+function handleRenameGroup(socket: AuthedSocket, message: RenameGroupMessage) {
+  const gate = requireGroupAdmin(socket, message.groupId);
+  if (!gate) return;
+  updateGroupNameStmt.run(message.name, message.groupId);
+  broadcastGroupUpdated(message.groupId);
+}
+
+function handleFetchGroups(socket: AuthedSocket) {
+  if (!socket.userId) return;
+  const groups = (listUserGroupsStmt.all(socket.userId) as GroupRow[]).map((g) => {
+    const info = groupInfoFor(g.group_id);
+    return (
+      info ?? {
+        groupId: g.group_id,
+        name: g.name,
+        members: [] as GroupInfo["members"],
+      }
+    );
+  });
+  const response: GroupsResponse = versioned({ type: "groups", groups });
+  send(socket, response);
+}
+
+function handleRequestHistory(socket: AuthedSocket, message: RequestHistoryMessage) {
+  if (!socket.userId) return;
+  const requester: string = socket.userId;
+  const requesterMember = findMemberStmt.get(message.groupId, requester) as MemberRow | undefined;
+  const targetMember = findMemberStmt.get(message.groupId, message.to) as
+    | MemberRow
+    | undefined;
+  if (!requesterMember || !targetMember) {
+    send(socket, errorMessage("NOT_FOUND", "not a group member"));
+    return;
+  }
+  const targetSocket = connections.get(message.to);
+  if (!targetSocket) {
+    send(socket, errorMessage("OFFLINE", "member offline"));
+    return;
+  }
+  const notice: HistoryRequestNotice = versioned({
+    type: "history_request",
+    groupId: message.groupId,
+    requester,
+  });
+  send(targetSocket, notice);
+}
+
 type EnvelopeRef = { message_id: string; client_message_id: string };
 
-/** Idempotent send lookup, scoped to the sender. Stale dedup rows are reaped so
- *  a clientMessageId can be reused after the TTL expires. */
-function findExistingEnvelope(
+/** Idempotent send lookup, scoped to the sender. One clientMessageId may own
+ *  several rows (group fan-out), so this returns all of them. Stale dedup rows
+ *  are reaped so ids can be reused after the TTL expires. */
+function findExistingEnvelopes(
   senderId: string,
   clientMessageId: string
-): EnvelopeRef | undefined {
-  const pending = findPendingByClientMessageIdStmt.get(senderId, clientMessageId) as
-    | EnvelopeRef
+): EnvelopeRef[] {
+  const pending = findPendingByClientMessageIdStmt.all(senderId, clientMessageId) as
+    | EnvelopeRef[]
     | undefined;
-  if (pending) return pending;
-  const processed = findProcessedMessageByClientMessageIdStmt.get(senderId, clientMessageId) as
-    | (ProcessedMessageRow & { created_at: number })
-    | undefined;
-  if (!processed) return undefined;
-  if (Date.now() - processed.created_at < PROCESSED_TTL_MS) {
-    return { message_id: processed.message_id, client_message_id: processed.client_message_id };
+  if (pending && pending.length > 0) return pending;
+  const processed = (
+    findProcessedMessageByClientMessageIdStmt.all(senderId, clientMessageId) as
+      | (ProcessedMessageRow & { created_at: number })[]
+      | undefined
+  ) ?? [];
+  const fresh = processed.filter((p) => Date.now() - p.created_at < PROCESSED_TTL_MS);
+  if (fresh.length > 0) {
+    return fresh.map((p) => ({
+      message_id: p.message_id,
+      client_message_id: p.client_message_id,
+    }));
   }
-  deleteProcessedByClientMessageIdStmt.run(senderId, clientMessageId);
-  return undefined;
+  if (processed.length > 0) {
+    deleteProcessedByClientMessageIdStmt.run(senderId, clientMessageId);
+  }
+  return [];
 }
 
 function relayMessage(socket: AuthedSocket, message: SendMessage) {
@@ -450,18 +779,35 @@ function relayMessage(socket: AuthedSocket, message: SendMessage) {
     return;
   }
   const now = Date.now();
-  const existing = findExistingEnvelope(senderId, message.clientMessageId);
-  if (existing) {
+  const existing = findExistingEnvelopes(senderId, message.clientMessageId);
+  if (existing.length > 0) {
+    const first = existing[0];
+    if (!first) {
+      send(socket, errorMessage("INVALID", "could not process frame"));
+      return;
+    }
     const ack: ServerAckMessage = versioned({
       type: "server_ack",
-      clientMessageId: existing.client_message_id,
-      messageId: existing.message_id,
+      clientMessageId: first.client_message_id,
+      messageId: first.message_id,
       status: "accepted",
       timestamp: now,
     });
     stats.relayed += 1;
     send(socket, ack);
     return;
+  }
+  // Group-tagged direct sends (e.g. member-to-member history shares) require
+  // both ends to be current members; otherwise the tag could file mail into a
+  // stranger's group thread.
+  const groupId = message.groupId ?? null;
+  if (groupId) {
+    const senderMember = findMemberStmt.get(groupId, senderId) as MemberRow | undefined;
+    const recipientMember = findMemberStmt.get(groupId, message.to) as MemberRow | undefined;
+    if (!senderMember || !recipientMember) {
+      send(socket, errorMessage("INVALID", "group tag requires both ends as members"));
+      return;
+    }
   }
   const messageId = generateMessageId();
   try {
@@ -470,6 +816,7 @@ function relayMessage(socket: AuthedSocket, message: SendMessage) {
       message.clientMessageId,
       senderId,
       message.to,
+      groupId,
       message.ciphertext,
       message.nonce,
       message.timestamp,
@@ -478,12 +825,13 @@ function relayMessage(socket: AuthedSocket, message: SendMessage) {
   } catch (err: unknown) {
     if (isUniqueViolation(err)) {
       // Lost race with a concurrent identical send: answer from the stored row.
-      const raced = findExistingEnvelope(senderId, message.clientMessageId);
-      if (raced) {
+      const raced = findExistingEnvelopes(senderId, message.clientMessageId);
+      const hit = raced[0];
+      if (hit) {
         const ack: ServerAckMessage = versioned({
           type: "server_ack",
-          clientMessageId: raced.client_message_id,
-          messageId: raced.message_id,
+          clientMessageId: hit.client_message_id,
+          messageId: hit.message_id,
           status: "accepted",
           timestamp: now,
         });
@@ -515,8 +863,131 @@ function relayMessage(socket: AuthedSocket, message: SendMessage) {
     nonce: message.nonce,
     timestamp: now,
   });
+  if (groupId) payload.groupId = groupId;
 
   send(recipientSocket, payload);
+}
+
+function relayGroupMessage(socket: AuthedSocket, message: SendGroupMessage) {
+  if (!socket.userId) return;
+  const senderId: string = socket.userId;
+  const group = findGroupStmt.get(message.groupId) as GroupRow | undefined;
+  if (!group) {
+    send(socket, errorMessage("NOT_FOUND", "group not found"));
+    return;
+  }
+  const senderMember = findMemberStmt.get(message.groupId, senderId) as MemberRow | undefined;
+  if (!senderMember) {
+    send(socket, errorMessage("UNAUTH", "not a group member"));
+    return;
+  }
+  const members = listGroupMembersStmt.all(message.groupId) as MemberRow[];
+  const memberIds = new Set(members.map((m) => m.user_id));
+  // Dedupe defensively; every envelope must target a current member, never self.
+  const targets = [...new Set(message.envelopes.map((e) => e.to))];
+  for (const to of targets) {
+    if (to === senderId || !memberIds.has(to)) {
+      send(socket, errorMessage("INVALID", "envelope recipient is not a group member"));
+      return;
+    }
+  }
+  if (targets.length === 0) {
+    send(socket, errorMessage("INVALID", "no recipients"));
+    return;
+  }
+  const now = Date.now();
+  const existing = findExistingEnvelopes(senderId, message.clientMessageId);
+  if (existing.length > 0) {
+    const ack: ServerAckMessage = versioned({
+      type: "server_ack",
+      clientMessageId: message.clientMessageId,
+      messageId: existing[0]?.message_id ?? "",
+      messageIds: existing.map((e) => e.message_id),
+      status: "accepted",
+      timestamp: now,
+    });
+    stats.relayed += 1;
+    stats.groupSends += 1;
+    send(socket, ack);
+    return;
+  }
+  const byRecipient = new Map(message.envelopes.map((e) => [e.to, e]));
+  const storedIds: string[] = [];
+  const idByRecipient = new Map<string, string>();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const to of targets) {
+      const env = byRecipient.get(to);
+      if (!env) continue;
+      const messageId = generateMessageId();
+      insertMessageStmt.run(
+        messageId,
+        message.clientMessageId,
+        senderId,
+        to,
+        message.groupId,
+        env.ciphertext,
+        env.nonce,
+        message.timestamp,
+        now
+      );
+      storedIds.push(messageId);
+      idByRecipient.set(to, messageId);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Best effort.
+    }
+    if (isUniqueViolation(err)) {
+      const raced = findExistingEnvelopes(senderId, message.clientMessageId);
+      if (raced.length > 0) {
+        const ack: ServerAckMessage = versioned({
+          type: "server_ack",
+          clientMessageId: message.clientMessageId,
+          messageId: raced[0]?.message_id ?? "",
+          messageIds: raced.map((e) => e.message_id),
+          status: "accepted",
+          timestamp: now,
+        });
+        send(socket, ack);
+      }
+      return;
+    }
+    throw err;
+  }
+  const ack: ServerAckMessage = versioned({
+    type: "server_ack",
+    clientMessageId: message.clientMessageId,
+    messageId: storedIds[0] ?? "",
+    messageIds: storedIds,
+    status: "accepted",
+    timestamp: now,
+  });
+  stats.relayed += 1;
+  stats.groupSends += 1;
+  send(socket, ack);
+
+  const envByRecipient = new Map(message.envelopes.map((e) => [e.to, e]));
+  for (const to of targets) {
+    const recipientSocket = connections.get(to);
+    const messageId = idByRecipient.get(to);
+    if (!recipientSocket || !messageId) continue;
+    const env = envByRecipient.get(to);
+    if (!env) continue;
+    const payload: IncomingEnvelope = versioned({
+      type: "incoming",
+      from: senderId,
+      messageId,
+      ciphertext: env.ciphertext,
+      nonce: env.nonce,
+      timestamp: now,
+    });
+    payload.groupId = message.groupId;
+    send(recipientSocket, payload);
+  }
 }
 
 function handleAck(socket: AuthedSocket, message: AckMessage) {
@@ -606,6 +1077,14 @@ function handleMessage(socket: AuthedSocket, message: ClientMessage) {
       }
       relayMessage(socket, message);
       break;
+    case "send_group":
+      if (!requireAuth(socket)) return;
+      if (!sendLimiter.take(socket.userId)) {
+        send(socket, errorMessage("RATE_LIMITED", "sending too fast"));
+        return;
+      }
+      relayGroupMessage(socket, message);
+      break;
     case "ack":
       if (!requireAuth(socket)) return;
       handleAck(socket, message);
@@ -617,6 +1096,62 @@ function handleMessage(socket: AuthedSocket, message: ClientMessage) {
     case "fetch_pending":
       if (!requireAuth(socket)) return;
       handleFetchPending(socket, message);
+      break;
+    case "create_group":
+      if (!requireAuth(socket)) return;
+      if (!groupLimiter.take(socket.userId)) {
+        send(socket, errorMessage("RATE_LIMITED", "too many group operations"));
+        return;
+      }
+      handleCreateGroup(socket, message);
+      break;
+    case "add_members":
+      if (!requireAuth(socket)) return;
+      if (!groupLimiter.take(socket.userId)) {
+        send(socket, errorMessage("RATE_LIMITED", "too many group operations"));
+        return;
+      }
+      handleAddMembers(socket, message);
+      break;
+    case "remove_member":
+      if (!requireAuth(socket)) return;
+      if (!groupLimiter.take(socket.userId)) {
+        send(socket, errorMessage("RATE_LIMITED", "too many group operations"));
+        return;
+      }
+      handleRemoveMember(socket, message);
+      break;
+    case "leave_group":
+      if (!requireAuth(socket)) return;
+      if (!groupLimiter.take(socket.userId)) {
+        send(socket, errorMessage("RATE_LIMITED", "too many group operations"));
+        return;
+      }
+      handleLeaveGroup(socket, message);
+      break;
+    case "rename_group":
+      if (!requireAuth(socket)) return;
+      if (!groupLimiter.take(socket.userId)) {
+        send(socket, errorMessage("RATE_LIMITED", "too many group operations"));
+        return;
+      }
+      handleRenameGroup(socket, message);
+      break;
+    case "fetch_groups":
+      if (!requireAuth(socket)) return;
+      if (!groupLimiter.take(socket.userId)) {
+        send(socket, errorMessage("RATE_LIMITED", "too many group operations"));
+        return;
+      }
+      handleFetchGroups(socket);
+      break;
+    case "request_history":
+      if (!requireAuth(socket)) return;
+      if (!groupLimiter.take(socket.userId)) {
+        send(socket, errorMessage("RATE_LIMITED", "too many group operations"));
+        return;
+      }
+      handleRequestHistory(socket, message);
       break;
     case "pong":
       break;
@@ -650,7 +1185,7 @@ function onConnection(rawSocket: net.Socket) {
     socket.lastActivity = Date.now();
     buffer += chunk;
 
-    if (buffer.length > MAX_FRAME_BYTES + 1024) {
+    if (buffer.length > MAX_GROUP_FRAME_BYTES + 4096) {
       send(socket, errorMessage("TOO_LARGE", "frame too large"));
       socket.destroy();
       return;
@@ -663,16 +1198,21 @@ function onConnection(rawSocket: net.Socket) {
       buffer = buffer.slice(newlineIndex + 1);
 
       if (raw.length > 0) {
-        if (raw.length > MAX_FRAME_BYTES) {
-          send(socket, errorMessage("TOO_LARGE", "frame too large"));
-          socket.destroy();
-          return;
-        }
         const parsed = parseFrame(raw);
         if (isErrorMessage(parsed)) {
           stats.framesRejected += 1;
           send(socket, parsed);
         } else {
+          // send_group legitimately exceeds the DM frame cap (up to 50
+          // envelopes); everything else stays under the tight limit.
+          const oversized =
+            raw.length > MAX_FRAME_BYTES &&
+            !(parsed.type === "send_group" && raw.length <= MAX_GROUP_FRAME_BYTES);
+          if (oversized) {
+            send(socket, errorMessage("TOO_LARGE", "frame too large"));
+            socket.destroy();
+            return;
+          }
           try {
             handleMessage(socket, parsed);
           } catch (err) {
@@ -715,6 +1255,7 @@ const heartbeat = setInterval(() => {
   sendLimiter.sweep(now);
   authLimiter.sweep(now);
   keysLimiter.sweep(now);
+  groupLimiter.sweep(now);
 }, PING_INTERVAL_MS);
 heartbeat.unref();
 
@@ -747,6 +1288,8 @@ const statsTimer = setInterval(() => {
       readsForwarded: stats.readsForwarded,
       keysServed: stats.keysServed,
       framesRejected: stats.framesRejected,
+      groupsCreated: stats.groupsCreated,
+      groupSends: stats.groupSends,
     },
     "server stats"
   );

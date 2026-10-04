@@ -73,6 +73,10 @@ export function generateMessageId(): string {
   return randomUUID();
 }
 
+export function generateGroupId(): string {
+  return `grp_${randomUUID()}`;
+}
+
 const MIN_USER_ID = 100_000_000_000;
 const MAX_USER_ID = 1_000_000_000_000;
 const MAX_ATTEMPTS = 10;

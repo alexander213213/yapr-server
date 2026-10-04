@@ -10,6 +10,7 @@ export const ErrorCode = z.enum([
   "INVALID",
   "UNAUTH",
   "NOT_FOUND",
+  "OFFLINE",
   "RATE_LIMITED",
   "TOO_LARGE",
   "UPGRADE_REQUIRED",
@@ -20,6 +21,7 @@ const v = z.literal(PROTOCOL_VERSION);
 const userIdField = z.string().min(1).max(64);
 const secretField = z.string().min(1).max(256);
 const messageIdField = z.string().min(1).max(128);
+const groupIdField = z.string().min(1).max(128);
 // Opaque E2EE envelope: base64 ciphertext (32KB cap) + base64 nonce.
 const ciphertextField = z.string().min(1).max(32 * 1024);
 const nonceField = z.string().max(128);
@@ -56,6 +58,9 @@ export const SendMessage = z.object({
   ciphertext: ciphertextField,
   nonce: nonceField,
   timestamp: z.number().int().nonnegative(),
+  // Optional group context (e.g. member-to-member history shares filed
+  // into the group thread). DMs omit it.
+  groupId: groupIdField.optional(),
 });
 export type SendMessage = z.infer<typeof SendMessage>;
 
@@ -93,6 +98,78 @@ export const PongMessage = z.object({
 });
 export type PongMessage = z.infer<typeof PongMessage>;
 
+const groupNameField = z.string().min(1).max(64);
+
+export const CreateGroupMessage = z.object({
+  v,
+  type: z.literal("create_group"),
+  name: groupNameField,
+  memberIds: z.array(userIdField).min(1).max(49),
+});
+export type CreateGroupMessage = z.infer<typeof CreateGroupMessage>;
+
+export const AddMembersMessage = z.object({
+  v,
+  type: z.literal("add_members"),
+  groupId: groupIdField,
+  userIds: z.array(userIdField).min(1).max(49),
+});
+export type AddMembersMessage = z.infer<typeof AddMembersMessage>;
+
+export const RemoveMemberMessage = z.object({
+  v,
+  type: z.literal("remove_member"),
+  groupId: groupIdField,
+  userId: userIdField,
+});
+export type RemoveMemberMessage = z.infer<typeof RemoveMemberMessage>;
+
+export const LeaveGroupMessage = z.object({
+  v,
+  type: z.literal("leave_group"),
+  groupId: groupIdField,
+});
+export type LeaveGroupMessage = z.infer<typeof LeaveGroupMessage>;
+
+export const RenameGroupMessage = z.object({
+  v,
+  type: z.literal("rename_group"),
+  groupId: groupIdField,
+  name: groupNameField,
+});
+export type RenameGroupMessage = z.infer<typeof RenameGroupMessage>;
+
+export const FetchGroupsMessage = z.object({
+  v,
+  type: z.literal("fetch_groups"),
+});
+export type FetchGroupsMessage = z.infer<typeof FetchGroupsMessage>;
+
+const GroupEnvelope = z.object({
+  to: userIdField,
+  ciphertext: ciphertextField,
+  nonce: nonceField,
+});
+
+export const SendGroupMessage = z.object({
+  v,
+  type: z.literal("send_group"),
+  clientMessageId: z.string().min(1).max(128),
+  groupId: groupIdField,
+  envelopes: z.array(GroupEnvelope).min(1).max(50),
+  timestamp: z.number().int().nonnegative(),
+});
+export type SendGroupMessage = z.infer<typeof SendGroupMessage>;
+
+export const RequestHistoryMessage = z.object({
+  v,
+  type: z.literal("request_history"),
+  groupId: groupIdField,
+  to: userIdField,
+  since: z.number().int().nonnegative().optional(),
+});
+export type RequestHistoryMessage = z.infer<typeof RequestHistoryMessage>;
+
 export const ClientMessage = z.discriminatedUnion("type", [
   RegisterMessage,
   IdentifyMessage,
@@ -102,6 +179,14 @@ export const ClientMessage = z.discriminatedUnion("type", [
   ReadMessage,
   FetchPendingMessage,
   PongMessage,
+  CreateGroupMessage,
+  AddMembersMessage,
+  RemoveMemberMessage,
+  LeaveGroupMessage,
+  RenameGroupMessage,
+  FetchGroupsMessage,
+  SendGroupMessage,
+  RequestHistoryMessage,
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 
@@ -115,6 +200,37 @@ export type KeysResponse = {
   v: 2;
   type: "keys";
   keys: Record<string, string>;
+};
+
+export type GroupInfo = {
+  groupId: string;
+  name: string;
+  members: { userId: string; role: "admin" | "member"; joinedAt: number }[];
+};
+
+export type GroupsResponse = {
+  v: 2;
+  type: "groups";
+  groups: GroupInfo[];
+};
+
+export type GroupCreatedResponse = {
+  v: 2;
+  type: "group_created";
+  groupId: string;
+};
+
+export type GroupUpdatedNotice = {
+  v: 2;
+  type: "group_updated";
+  groupId: string;
+};
+
+export type HistoryRequestNotice = {
+  v: 2;
+  type: "history_request";
+  groupId: string;
+  requester: string;
 };
 
 export type PendingDone = {
