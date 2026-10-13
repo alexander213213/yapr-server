@@ -92,8 +92,13 @@ Framing is TLS + newline-delimited JSON, every frame carrying `v: 2`. Anything e
 
 | Direction | Frames |
 |---|---|
-| Client → server | `register{pubKey}`, `identify`, `fetch_keys`, `send{ciphertext,nonce}`, `ack`, `read`, `fetch_pending{cursor,limit}`, `pong` |
-| Server → client | `registered`, `identified`, `keys`, `server_ack`, `incoming`, `pending_done{hasMore}`, `read_receipt`, `ping`, `error{code}` |
+| Client → server | `register{pubKey}`, `identify`, `fetch_keys`, `send{ciphertext,nonce}`, `ack`, `read`, `fetch_pending{cursor,limit}`, `pong`, `request_history{groupId,to?,before?,limit?}`, `share_history_done{to,groupId,count}` |
+| Server → client | `registered`, `identified`, `keys`, `server_ack`, `incoming`, `pending_done{hasMore}`, `read_receipt`, `ping`, `history_request{groupId,requester,before?,limit?}`, `history_done{groupId,count,from}`, `error{code}` |
+
+Omitting `to` from `request_history` selects automatic mode: the server relays
+to the oldest online member (presence never leaves the server) or answers
+`OFFLINE` when nobody is online. Round completion is signaled with
+`history_done`; a full batch means the requester should prompt the next round.
 
 Errors are coded (`INVALID`, `UNAUTH`, `NOT_FOUND`, `RATE_LIMITED`, `TOO_LARGE`,
 `UPGRADE_REQUIRED`) with generic messages. Legacy plaintext rows from v1 installs are

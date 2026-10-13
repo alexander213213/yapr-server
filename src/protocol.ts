@@ -165,10 +165,30 @@ export const RequestHistoryMessage = z.object({
   v,
   type: z.literal("request_history"),
   groupId: groupIdField,
-  to: userIdField,
-  since: z.number().int().nonnegative().optional(),
+  // Absent `to` = automatic mode: the server elects the oldest online member
+  // (presence never leaves the server). Present = legacy manual targeting.
+  to: userIdField.optional(),
+  // Gap window: rows older than `before` (the requester's earliest local row),
+  // up to `limit` rows. Absent = legacy manual semantics. (Replaces the dead
+  // `since` field, which no client ever sent and nothing ever read.)
+  before: z.number().int().nonnegative().optional(),
+  limit: z.number().int().min(1).max(50).optional(),
 });
 export type RequestHistoryMessage = z.infer<typeof RequestHistoryMessage>;
+
+// Sharer → requester round completion, relayed like the request itself.
+// `count` full (= limit) means the requester should prompt the next round;
+// anything less means the floor is reached. Best-effort: dropped when the
+// requester is offline (shares still await in their inbox; the client
+// reconciles on sync).
+export const ShareHistoryDoneMessage = z.object({
+  v,
+  type: z.literal("share_history_done"),
+  to: userIdField,
+  groupId: groupIdField,
+  count: z.number().int().nonnegative().max(10000),
+});
+export type ShareHistoryDoneMessage = z.infer<typeof ShareHistoryDoneMessage>;
 
 export const ClientMessage = z.discriminatedUnion("type", [
   RegisterMessage,
@@ -187,6 +207,7 @@ export const ClientMessage = z.discriminatedUnion("type", [
   FetchGroupsMessage,
   SendGroupMessage,
   RequestHistoryMessage,
+  ShareHistoryDoneMessage,
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 
@@ -231,6 +252,16 @@ export type HistoryRequestNotice = {
   type: "history_request";
   groupId: string;
   requester: string;
+  before?: number;
+  limit?: number;
+};
+
+export type HistoryDoneNotice = {
+  v: 2;
+  type: "history_done";
+  groupId: string;
+  count: number;
+  from: string;
 };
 
 export type PendingDone = {

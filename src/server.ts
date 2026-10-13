@@ -14,6 +14,7 @@ import {
   GroupInfo,
   GroupUpdatedNotice,
   GroupsResponse,
+  HistoryDoneNotice,
   HistoryRequestNotice,
   KeysResponse,
   LeaveGroupMessage,
@@ -24,6 +25,7 @@ import {
   RequestHistoryMessage,
   SendGroupMessage,
   SendMessage,
+  ShareHistoryDoneMessage,
   errorMessage,
   isErrorMessage,
   parseFrame,
@@ -51,6 +53,7 @@ import {
 } from "./limits.js";
 import { logger } from "./logger.js";
 import { isUniqueViolation } from "./sqlite.js";
+import { electHistorySharer } from "./historyElection.js";
 
 export type IncomingEnvelope = {
   v: 2;
@@ -719,24 +722,96 @@ function handleRequestHistory(socket: AuthedSocket, message: RequestHistoryMessa
   if (!socket.userId) return;
   const requester: string = socket.userId;
   const requesterMember = findMemberStmt.get(message.groupId, requester) as MemberRow | undefined;
-  const targetMember = findMemberStmt.get(message.groupId, message.to) as
-    | MemberRow
-    | undefined;
-  if (!requesterMember || !targetMember) {
+  if (!requesterMember) {
     send(socket, errorMessage("NOT_FOUND", "not a group member"));
     return;
   }
-  const targetSocket = connections.get(message.to);
-  if (!targetSocket) {
-    send(socket, errorMessage("OFFLINE", "member offline"));
+  if (message.to !== undefined) {
+    // Legacy manual mode: one explicitly targeted member.
+    const targetMember = findMemberStmt.get(message.groupId, message.to) as
+      | MemberRow
+      | undefined;
+    if (!targetMember) {
+      send(socket, errorMessage("NOT_FOUND", "not a group member"));
+      return;
+    }
+    const targetSocket = connections.get(message.to);
+    if (!targetSocket) {
+      send(socket, errorMessage("OFFLINE", "member offline"));
+      return;
+    }
+    send(targetSocket, historyRequestNoticeFor(message.groupId, requester, message));
     return;
   }
+  // Automatic mode: elect the oldest online member. Presence never leaves the
+  // server — the requester learns only who actually shares with them.
+  // Note: creator and initial members share one joinedAt by construction, so
+  // ties are normal; the userId tiebreak keeps the choice deterministic.
+  const members = listGroupMembersStmt.all(message.groupId) as
+    | { user_id: string; joined_at: number }[]
+    | undefined;
+  const online = new Set<string>();
+  for (const [id] of connections) online.add(id);
+  const targetId = electHistorySharer(
+    (members ?? []).map((m) => ({ userId: m.user_id, joinedAt: m.joined_at })),
+    online,
+    requester
+  );
+  if (!targetId) {
+    send(socket, errorMessage("OFFLINE", "no members online"));
+    return;
+  }
+  const targetSocket = connections.get(targetId);
+  if (!targetSocket) {
+    // Race: the elected member disconnected between election and send.
+    send(socket, errorMessage("OFFLINE", "no members online"));
+    return;
+  }
+  send(targetSocket, historyRequestNoticeFor(message.groupId, requester, message));
+}
+
+function historyRequestNoticeFor(
+  groupId: string,
+  requester: string,
+  message: RequestHistoryMessage
+): HistoryRequestNotice {
   const notice: HistoryRequestNotice = versioned({
     type: "history_request",
-    groupId: message.groupId,
+    groupId,
     requester,
   });
-  send(targetSocket, notice);
+  if (message.before !== undefined) notice.before = message.before;
+  if (message.limit !== undefined) notice.limit = message.limit;
+  return notice;
+}
+
+/**
+ * Round-completion signal for automatic backfill: the sharer tells the
+ * requester how many rows it sent (full batch = prompt the next round,
+ * anything less = floor reached). Best-effort when the requester is offline:
+ * the shares themselves still await in their inbox and the client reconciles
+ * on sync. Both ends must be current members, like group-tagged sends.
+ */
+function handleShareHistoryDone(socket: AuthedSocket, message: ShareHistoryDoneMessage) {
+  if (!socket.userId) return;
+  const sender: string = socket.userId;
+  const senderMember = findMemberStmt.get(message.groupId, sender) as MemberRow | undefined;
+  const recipientMember = findMemberStmt.get(message.groupId, message.to) as
+    | MemberRow
+    | undefined;
+  if (!senderMember || !recipientMember) {
+    send(socket, errorMessage("NOT_FOUND", "not a group member"));
+    return;
+  }
+  const target = connections.get(message.to);
+  if (!target) return;
+  const done: HistoryDoneNotice = versioned({
+    type: "history_done",
+    groupId: message.groupId,
+    count: message.count,
+    from: sender,
+  });
+  send(target, done);
 }
 
 type EnvelopeRef = { message_id: string; client_message_id: string };
@@ -1152,6 +1227,14 @@ function handleMessage(socket: AuthedSocket, message: ClientMessage) {
         return;
       }
       handleRequestHistory(socket, message);
+      break;
+    case "share_history_done":
+      if (!requireAuth(socket)) return;
+      if (!groupLimiter.take(socket.userId)) {
+        send(socket, errorMessage("RATE_LIMITED", "too many group operations"));
+        return;
+      }
+      handleShareHistoryDone(socket, message);
       break;
     case "pong":
       break;
