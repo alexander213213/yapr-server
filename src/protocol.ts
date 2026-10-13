@@ -43,6 +43,19 @@ export const IdentifyMessage = z.object({
 });
 export type IdentifyMessage = z.infer<typeof IdentifyMessage>;
 
+// Account recovery: bearer token minted by this server (see reclaim.ts).
+// The token carries only the user id; the server mints a FRESH secret on
+// reclaim and returns it via the normal `registered` reply.
+const tokenField = z.string().min(1).max(512);
+
+export const ReclaimMessage = z.object({
+  v,
+  type: z.literal("reclaim"),
+  token: tokenField,
+  pubKey: pubKeyField,
+});
+export type ReclaimMessage = z.infer<typeof ReclaimMessage>;
+
 export const FetchKeysMessage = z.object({
   v,
   type: z.literal("fetch_keys"),
@@ -173,6 +186,7 @@ export type RequestHistoryMessage = z.infer<typeof RequestHistoryMessage>;
 export const ClientMessage = z.discriminatedUnion("type", [
   RegisterMessage,
   IdentifyMessage,
+  ReclaimMessage,
   FetchKeysMessage,
   SendMessage,
   AckMessage,
