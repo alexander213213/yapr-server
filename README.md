@@ -19,6 +19,10 @@ them while recipients are offline, and deletes them once acknowledged.
 - **Durable storage** — SQLite in the OS data dir (survives npm updates), automatic
   schema migrations with pre-migration backups, hourly cleanup of old dedup rows.
 - **Observable** — structured logs, per-minute stats summaries, Docker healthcheck.
+- **Account recovery** — server-sealed bearer tokens let clients silently reclaim
+  their user id after server data loss (fresh secret, normal login after).
+  Set `YAPR_RECLAIM_KEY`; without it recovery is off. Group memberships are
+  never restored from tokens — re-adding stays an admin action.
 
 ## Requirements
 
@@ -57,6 +61,31 @@ npm start            # node dist/server.js (production entrypoint)
 | `RATE_REGISTER_MAX` / `RATE_AUTH_MAX` / `RATE_SEND_MAX` / `RATE_KEYS_MAX` | `10` / `20` / `120` / `60` | Per-minute budgets (windows tunable via `*_WINDOW_MS`) |
 | `PROCESSED_TTL_MS` | 30 days | Idempotent-resend horizon + dedup GC TTL |
 | `STATS_INTERVAL_MS` | `60000` | Stats summary period |
+| `YAPR_RECLAIM_KEY` | — | Base64 32B key for account-recovery tokens (see below). Unset = recovery off |
+
+## Account recovery
+
+If the database is lost (e.g. a deploy without the `/data` volume), clients
+can silently reclaim their previous user id instead of forking to a new one —
+contacts and history on other devices resolve again because ids anchor both.
+
+How it works:
+
+1. Set `YAPR_RECLAIM_KEY` to a base64 32-byte secret (generate with
+   `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`)
+   and back it up offsite alongside the TLS key. Every `register` and
+   `identify` then returns a server-sealed bearer token the client stores.
+2. On data loss, the client's next login is rejected, so it presents its token
+   (`reclaim` frame). The server re-creates that id with a **fresh** secret,
+   and the client logs in normally. No prompts, no manual steps.
+3. Reclaim on an existing id is rejected, and the client never auto-registers
+   a new id while it holds a token — a failed recovery stays visible until the
+   operator is contacted, instead of silently forking identity.
+
+Limits: the token is password-equivalent (whoever holds it claims the id on a
+fresh server) — treat client backups as credentials. Group memberships are not
+restored (a stale token must not re-admit a removed member); re-adding stays
+an admin action. Messages in flight when the data was lost stay lost.
 
 ## Deploying
 

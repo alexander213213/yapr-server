@@ -22,6 +22,7 @@ import {
   ReadMessage,
   RemoveMemberMessage,
   RenameGroupMessage,
+  ReclaimMessage,
   RequestHistoryMessage,
   SendGroupMessage,
   SendMessage,
@@ -54,6 +55,11 @@ import {
 import { logger } from "./logger.js";
 import { isUniqueViolation } from "./sqlite.js";
 import { electHistorySharer } from "./historyElection.js";
+import {
+  getReclaimKey,
+  mintReclaimToken,
+  verifyReclaimToken,
+} from "./reclaim.js";
 
 export type IncomingEnvelope = {
   v: 2;
@@ -422,6 +428,61 @@ function registerUser(socket: AuthedSocket, pubKey: string) {
     type: "registered",
     userId,
     secret,
+    ...reclaimTokenField(userId),
+  }));
+}
+
+/**
+ * Mint a recovery token for an account, or nothing when the reclaim key is
+ * unconfigured (feature off). Returned object spreads into replies; old
+ * clients strip-ignored the unknown field.
+ */
+function reclaimTokenField(userId: string): { reclaimToken?: string } {
+  const key = getReclaimKey();
+  if (!key) return {};
+  return { reclaimToken: mintReclaimToken(key, userId) };
+}
+
+/**
+ * Silent account recovery after server data loss. The bearer token re-creates
+ * the account row with a FRESH secret (returned via the normal `registered`
+ * reply); the claimer must then identify normally. Reclaim on an existing id
+ * is rejected: a stolen token must never reset a live account. Group
+ * memberships are never restored (a stale token must not re-admit a removed
+ * member) — re-adding stays an admin action.
+ */
+function handleReclaim(socket: AuthedSocket, message: ReclaimMessage) {
+  const key = getReclaimKey();
+  if (!key) {
+    send(socket, errorMessage("INVALID", "recovery unavailable"));
+    return;
+  }
+  const userId = verifyReclaimToken(key, message.token);
+  if (!userId) {
+    send(socket, errorMessage("INVALID", "recovery failed"));
+    return;
+  }
+  if (findUserStmt.get(userId)) {
+    send(socket, errorMessage("INVALID", "already registered"));
+    return;
+  }
+  const secret = generateSecret();
+  try {
+    insertUserStmt.run(userId, "", hashSecret(secret), message.pubKey);
+  } catch (err: unknown) {
+    if (isUniqueViolation(err)) {
+      send(socket, errorMessage("INVALID", "already registered"));
+      return;
+    }
+    throw err;
+  }
+  stats.registered += 1;
+  logger.info({ userId }, "account recovered via reclaim token");
+  send(socket, versioned({
+    type: "registered",
+    userId,
+    secret,
+    ...reclaimTokenField(userId),
   }));
 }
 
@@ -470,6 +531,7 @@ function identifyUser(socket: AuthedSocket, userId: string, secret: string) {
   send(socket, versioned({
     type: "identified",
     userId,
+    ...reclaimTokenField(userId),
   }));
   socket.once("close", () => {
     const current = connections.get(userId);
@@ -1133,6 +1195,14 @@ function handleMessage(socket: AuthedSocket, message: ClientMessage) {
         return;
       }
       identifyUser(socket, message.userId, message.secret);
+      break;
+
+    case "reclaim":
+      if (!registerLimiter.take(ip)) {
+        send(socket, errorMessage("RATE_LIMITED", "too many registrations"));
+        return;
+      }
+      handleReclaim(socket, message);
       break;
 
     case "fetch_keys":
