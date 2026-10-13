@@ -14,7 +14,21 @@ describe("parseFrame (v2)", () => {
     const msg = parseFrame(
       `{${V},"type":"send","clientMessageId":"a","to":"123","ciphertext":"Y2lwaGVy","nonce":"bm9uY2U=","timestamp":123}`
     );
+    expect(isErrorMessage(msg)).toBe(false);
     expect(msg).toMatchObject({ v: 2, type: "send", to: "123" });
+  });
+
+  it("parses a valid reclaim frame", () => {
+    const msg = parseFrame(`{${V},"type":"reclaim","token":"dG9rZW4=","pubKey":"cHVia2V5"}`);
+    expect(isErrorMessage(msg)).toBe(false);
+    expect(msg).toMatchObject({ v: 2, type: "reclaim", token: "dG9rZW4=" });
+  });
+
+  it("rejects reclaim frames with missing or oversize tokens", () => {
+    const missing = parseFrame(`{${V},"type":"reclaim","pubKey":"cHVia2V5"}`);
+    expect(isErrorMessage(missing)).toBe(true);
+    const big = parseFrame(`{${V},"type":"reclaim","token":"${"x".repeat(513)}","pubKey":"cHVia2V5"}`);
+    expect(isErrorMessage(big)).toBe(true);
   });
 
   it("parses fetch_keys, ack, read, fetch_pending and pong", () => {
