@@ -117,6 +117,25 @@ describe("parseFrame (v2)", () => {
     ).toMatchObject({ type: "request_history" });
   });
 
+  it("parses automatic history requests (no `to`) with gap bounds", () => {
+    const msg = parseFrame(`{${V},"type":"request_history","groupId":"g","before":1700000000000,"limit":20}`);
+    expect(isErrorMessage(msg)).toBe(false);
+    expect(msg).toMatchObject({ type: "request_history", groupId: "g", before: 1700000000000, limit: 20 });
+  });
+
+  it("rejects history requests with out-of-range limits", () => {
+    const msg = parseFrame(`{${V},"type":"request_history","groupId":"g","limit":51}`);
+    expect(isErrorMessage(msg)).toBe(true);
+  });
+
+  it("parses share_history_done and rejects bad counts", () => {
+    const msg = parseFrame(`{${V},"type":"share_history_done","to":"1","groupId":"g","count":20}`);
+    expect(isErrorMessage(msg)).toBe(false);
+    expect(msg).toMatchObject({ type: "share_history_done", count: 20 });
+    const bad = parseFrame(`{${V},"type":"share_history_done","to":"1","groupId":"g","count":-1}`);
+    expect(isErrorMessage(bad)).toBe(true);
+  });
+
   it("parses send_group with per-member envelopes", () => {
     const msg = parseFrame(
       JSON.stringify({
