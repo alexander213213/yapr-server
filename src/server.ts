@@ -752,6 +752,27 @@ function handleLeaveGroup(socket: AuthedSocket, message: LeaveGroupMessage) {
     send(socket, errorMessage("NOT_FOUND", "not a group member"));
     return;
   }
+  if (message.heir !== undefined) {
+    // Explicit admin handover: only an admin may designate, and only a
+    // current member other than themselves. The crown lands BEFORE the drop
+    // so the auto-pass inside finds an admin present and stays out.
+    if (member.role !== "admin") {
+      send(socket, errorMessage("INVALID", "only admins designate heirs"));
+      return;
+    }
+    if (message.heir === socket.userId) {
+      send(socket, errorMessage("INVALID", "heir must be another member"));
+      return;
+    }
+    const heirMember = findMemberStmt.get(message.groupId, message.heir) as
+      | MemberRow
+      | undefined;
+    if (!heirMember) {
+      send(socket, errorMessage("NOT_FOUND", "heir is not a group member"));
+      return;
+    }
+    updateMemberRoleStmt.run("admin", message.groupId, message.heir);
+  }
   const userId: string = socket.userId;
   dropMembership(message.groupId, userId);
   broadcastGroupUpdated(message.groupId);
