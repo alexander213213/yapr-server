@@ -108,6 +108,10 @@ describe("parseFrame (v2)", () => {
     expect(parseFrame(`{${V},"type":"leave_group","groupId":"g"}`)).toMatchObject({
       type: "leave_group",
     });
+    expect(parseFrame(`{${V},"type":"leave_group","groupId":"g","heir":"9"}`)).toMatchObject({
+      type: "leave_group",
+      heir: "9",
+    });
     expect(parseFrame(`{${V},"type":"rename_group","groupId":"g","name":"new"}`)).toMatchObject({
       type: "rename_group",
     });

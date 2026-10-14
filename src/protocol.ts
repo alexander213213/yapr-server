@@ -141,6 +141,10 @@ export const LeaveGroupMessage = z.object({
   v,
   type: z.literal("leave_group"),
   groupId: groupIdField,
+  // Chosen successor for admin handover (centralized nicknames): the leaver
+  // must be admin, the heir a current member other than themselves. Absent =
+  // legacy behavior (longest-tenured auto-pass inside dropMembership).
+  heir: userIdField.optional(),
 });
 export type LeaveGroupMessage = z.infer<typeof LeaveGroupMessage>;
 
