@@ -140,6 +140,25 @@ describe("parseFrame (v2)", () => {
     expect(isErrorMessage(bad)).toBe(true);
   });
 
+  it("parses share_history_done floor cursors and rejects bad floors", () => {
+    const withFloor = parseFrame(
+      `{${V},"type":"share_history_done","to":"1","groupId":"g","count":20,"floor":1700000000000}`
+    );
+    expect(isErrorMessage(withFloor)).toBe(false);
+    expect(withFloor).toMatchObject({ type: "share_history_done", count: 20, floor: 1700000000000 });
+    // Legacy sharers omit the cursor entirely.
+    const legacy = parseFrame(`{${V},"type":"share_history_done","to":"1","groupId":"g","count":0}`);
+    expect(isErrorMessage(legacy)).toBe(false);
+    expect(legacy).toMatchObject({ type: "share_history_done", count: 0 });
+    expect((legacy as { floor?: unknown }).floor).toBeUndefined();
+    for (const floor of [`"1700000000000"`, "-1", "1.5"]) {
+      const bad = parseFrame(
+        `{${V},"type":"share_history_done","to":"1","groupId":"g","count":20,"floor":${floor}}`
+      );
+      expect(isErrorMessage(bad)).toBe(true);
+    }
+  });
+
   it("parses send_group with per-member envelopes", () => {
     const msg = parseFrame(
       JSON.stringify({

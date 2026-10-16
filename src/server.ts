@@ -894,6 +894,11 @@ function handleShareHistoryDone(socket: AuthedSocket, message: ShareHistoryDoneM
     count: message.count,
     from: sender,
   });
+  // Cursor relay: lets the requester advance through already-held rows.
+  // Absent on legacy shares (requester falls back to earliest-tightening).
+  if (message.floor !== undefined && message.floor !== null) {
+    done.floor = message.floor;
+  }
   send(target, done);
 }
 
