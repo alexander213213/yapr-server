@@ -195,7 +195,11 @@ export type RequestHistoryMessage = z.infer<typeof RequestHistoryMessage>;
 
 // Sharer → requester round completion, relayed like the request itself.
 // `count` full (= limit) means the requester should prompt the next round;
-// anything less means the floor is reached. Best-effort: dropped when the
+// anything less means the floor is reached. `floor` (when present) is the
+// oldest created_at the sharer served this round — the requester's cursor
+// for the next window, so walks advance through already-held rows instead
+// of re-serving them. Absent = legacy sharer (requester falls back to
+// earliest-tightening). Best-effort: dropped when the
 // requester is offline (shares still await in their inbox; the client
 // reconciles on sync).
 export const ShareHistoryDoneMessage = z.object({
@@ -204,6 +208,7 @@ export const ShareHistoryDoneMessage = z.object({
   to: userIdField,
   groupId: groupIdField,
   count: z.number().int().nonnegative().max(10000),
+  floor: z.number().int().nonnegative().nullish(),
 });
 export type ShareHistoryDoneMessage = z.infer<typeof ShareHistoryDoneMessage>;
 
@@ -280,6 +285,7 @@ export type HistoryDoneNotice = {
   groupId: string;
   count: number;
   from: string;
+  floor?: number;
 };
 
 export type PendingDone = {
