@@ -25,6 +25,13 @@ db.exec(`
   PRAGMA foreign_keys = ON;
 `);
 
+// A users table without schema_version is the pre-versioning v1 layout (old
+// dist/db.js): it must enter the chain at v1, not be stamped current.
+const tableExists = (name: string): boolean =>
+  db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name) !==
+  undefined;
+const preVersioned = tableExists("users") && !tableExists("schema_version");
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
@@ -86,8 +93,8 @@ const row = db
   .get() as { version: number } | undefined;
 let version: number;
 if (!row) {
-  db.prepare(`INSERT INTO schema_version (version) VALUES (?)`).run(SCHEMA_VERSION);
-  version = SCHEMA_VERSION;
+  version = preVersioned ? 1 : SCHEMA_VERSION;
+  db.prepare(`INSERT INTO schema_version (version) VALUES (?)`).run(version);
 } else {
   version = row.version;
 }
@@ -172,8 +179,9 @@ if (version === 2) {
     throw err;
   }
   db.exec(`DROP TABLE pending_messages_v1`);
-  db.prepare(`UPDATE schema_version SET version = ?`).run(SCHEMA_VERSION);
-  version = SCHEMA_VERSION;
+  // Step to 3, not current: the v3->v4 rebuild (group_id, fan-out keys) must still run.
+  db.prepare(`UPDATE schema_version SET version = ?`).run(3);
+  version = 3;
   console.log(`migrated ${legacy.length} pending rows to opaque envelopes`);
 }
 
