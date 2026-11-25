@@ -43,11 +43,18 @@ export function ensureDataDir(): string {
   const dir = resolveDataDir();
   fs.mkdirSync(dir, { recursive: true });
 
+  // An explicit data dir is a deliberate choice (tests, deploys): never seed it.
+  if (process.env.YAPR_SERVER_DATA_DIR?.trim()) return dir;
+
   const target = dbPathFor(dir);
   if (!fs.existsSync(target)) {
     const legacy = legacyDbPath();
     if (path.resolve(legacy) !== path.resolve(target) && fs.existsSync(legacy)) {
       fs.copyFileSync(legacy, target);
+      // WAL mode: committed rows may still live in the sidecars.
+      for (const suffix of ["-wal", "-shm"]) {
+        if (fs.existsSync(legacy + suffix)) fs.copyFileSync(legacy + suffix, target + suffix);
+      }
       console.log(`migrated legacy db ${legacy} -> ${target}`);
     }
   }
